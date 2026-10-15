@@ -31,16 +31,24 @@ lavalink/
    | `LAVALINK_SERVER_PASSWORD` | a long random string |
    | `PORT` | `2333` |
    | `LAVALINK_BIND` | `::` (only if your environment uses IPv6-only private networking; otherwise omit) |
-   | `YOUTUBE_OAUTH_REFRESH_TOKEN` | leave empty for now |
+   | `YOUTUBE_OAUTH_ENABLED` | `false` by default; set `true` only after deciding to enable YouTube OAuth |
+   | `YOUTUBE_OAUTH_REFRESH_TOKEN` | Leave empty unless you have a valid refresh token |
 
 4. Do **not** generate a public domain; the bot connects over Railway's private network.
 5. Deploy and open the service logs.
 
-## 3. Authorize YouTube OAuth (one time)
+## 3. Enable YouTube OAuth (optional)
 
-1. In the Lavalink logs, find the OAuth message containing `https://www.google.com/device` and a code.
+Lavalink starts with YouTube OAuth disabled, so a missing or invalid refresh token cannot take the whole music backend offline. Voice connections and non-YouTube sources remain available.
+
+To enable YouTube OAuth:
+
+1. Set `YOUTUBE_OAUTH_ENABLED=true` on the Lavalink service and leave `YOUTUBE_OAUTH_REFRESH_TOKEN` empty. Deploy and wait for the plugin to print its device login URL and code in the Lavalink logs.
 2. Open the URL and enter the code using a **throwaway Google account** (never your main account).
-3. The logs then print a **refresh token**. Copy it into `YOUTUBE_OAUTH_REFRESH_TOKEN` on the `lavalink` service and redeploy. Future restarts skip the prompt.
+3. Copy the newly issued refresh token from the Lavalink logs into `YOUTUBE_OAUTH_REFRESH_TOKEN` and keep `YOUTUBE_OAUTH_ENABLED=true`.
+4. Redeploy Lavalink. Do not share the refresh token in chat or commit it to GitHub.
+
+If Lavalink crashes with `Invalid status code for oauth2 token fetch: 400`, clear `YOUTUBE_OAUTH_REFRESH_TOKEN`, set `YOUTUBE_OAUTH_ENABLED=false`, and redeploy. Obtain a fresh token before enabling OAuth again.
 
 ## 4. Deploy the bot
 
