@@ -19,7 +19,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, NamedTuple, Optional, TypeVar, get_args
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import aiohttp
 import discord
@@ -60,7 +60,19 @@ def _parse_ids(raw: str) -> set[int]:
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 SIBLING_BOT_IDS = _parse_ids(os.getenv("SIBLING_BOT_IDS", ""))
-LAVALINK_URI = os.getenv("LAVALINK_URI", "http://localhost:2333")
+def _normalize_lavalink_uri(raw: str) -> str:
+    uri = raw.strip() or "http://localhost:2333"
+    if "://" not in uri:
+        uri = f"http://{uri}"
+    parsed = urlsplit(uri)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("LAVALINK_URI must be an http(s) URL with a hostname")
+    if parsed.port is None and parsed.scheme == "http" and parsed.hostname.lower().endswith(".railway.internal"):
+        uri = urlunsplit((parsed.scheme, f"{parsed.hostname}:2333", parsed.path, parsed.query, parsed.fragment))
+    return uri.rstrip("/")
+
+
+LAVALINK_URI = _normalize_lavalink_uri(os.getenv("LAVALINK_URI", "http://localhost:2333"))
 LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "")
 STATE_FILE = Path(os.getenv("STATE_FILE", "/data/state.json"))
 BOT_PREFIX = os.getenv("BOT_PREFIX", ".")
