@@ -85,6 +85,8 @@ sentry:
   environment: ""
 
 logging:
+  request:
+    includePayload: false
   file:
     path: ./logs/
   level:
