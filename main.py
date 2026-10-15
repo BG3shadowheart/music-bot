@@ -1657,6 +1657,10 @@ class Music(commands.Cog):
                 )
                 return
             player = await self.ensure_player(ctx, connect=True)
+            # Playing music should also opt this guild into persistent 24/7 voice mode.
+            player.stay_247 = True
+            self.cancel_task(self.idle_tasks, ctx.guild.id)
+            self.cancel_task(self.empty_tasks, ctx.guild.id)
             room = MAX_QUEUE - player.queue.count
             if room <= 0:
                 raise UserFacingError(f"The queue is full ({MAX_QUEUE} tracks).")
