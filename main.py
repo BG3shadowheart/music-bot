@@ -322,6 +322,11 @@ class BotPlayer(wavelink.Player):
         self.auto_pause_reasons: set[str] = set()  # "empty" / "muted"
         self.user_paused: bool = False
         self.pause_lock = asyncio.Lock()
+        self.play_lock = asyncio.Lock()
+        self.starting_track: bool = False
+        self.panel_message_id: int | None = None
+        self.last_end_signature: tuple[str, str] | None = None
+        self.last_end_at: float = 0.0
         # Queue advancement is handled by the bot (own loop/autoplay/fallback logic).
         self.autoplay = wavelink.AutoPlayMode.disabled
 
@@ -376,6 +381,7 @@ def snapshot_player(player: BotPlayer, previous: dict[str, Any] | None = None) -
     return {
         "channel_id": channel_id,
         "text_channel_id": player.text_channel_id,
+        "panel_message_id": player.panel_message_id,
         "current": track_to_raw(current),
         "position": int(player.position) if current else 0,
         "paused": bool(player.paused),
@@ -481,6 +487,14 @@ class MusicBot(commands.Bot):
             headers={"User-Agent": "SelfHostedMusicBot/1.0"},
         )
         await self.add_cog(Music(self))
+        allowed = {"help", "join", "play", "stop"}
+        for name in list(self.all_commands):
+            if name not in allowed:
+                self.remove_command(name)
+        for command in list(self.tree.get_commands()):
+            if command.name not in allowed:
+                self.tree.remove_command(command.name)
+        self.add_view(MusicControls(self))
         if SYNC_SLASH:
             try:
                 synced = await self.tree.sync()
@@ -842,6 +856,10 @@ class Music(commands.Cog):
         player.filter_name = data.get("filter") if data.get("filter") in get_args(FilterName) else "off"
         player.volume_pref = max(0, min(100, int(data.get("volume", DEFAULT_VOLUME))))
         player.text_channel_id = data.get("text_channel_id")
+        try:
+            player.panel_message_id = int(data.get("panel_message_id")) if data.get("panel_message_id") else None
+        except (TypeError, ValueError):
+            player.panel_message_id = None
         for track in queued:
             player.queue.put(track)
         player.user_paused = bool(data.get("user_paused"))
@@ -997,6 +1015,51 @@ class Music(commands.Cog):
         asyncio.get_running_loop().call_later(15, self.bot.leaving.discard, guild.id)
         log.info("left voice guild=%s", guild.id)
 
+    async def update_panel(
+        self,
+        player: BotPlayer,
+        *,
+        track: wavelink.Playable | None = None,
+        status: str | None = None,
+        force_status: bool = False,
+    ) -> None:
+        if player.guild is None or player.text_channel_id is None:
+            return
+        channel = self.bot.get_channel(player.text_channel_id)
+        if not isinstance(channel, discord.abc.Messageable):
+            return
+        current = track if track is not None else (None if force_status else player.current)
+        if current is not None:
+            embed = self.now_playing_embed(player, current)
+        else:
+            embed = discord.Embed(title="Music player", description=status or "Nothing is playing.", color=EMBED_COLOR)
+            embed.set_footer(text=f"24/7: {'on' if player.stay_247 else 'off'} • Volume {player.volume_pref}%")
+        upcoming = list(player.queue)[:5]
+        if upcoming:
+            embed.add_field(
+                name="Up next",
+                value="\n".join(f"{index}. {track_line(item)}" for index, item in enumerate(upcoming, 1))[:1024],
+                inline=False,
+            )
+        view = MusicControls(self.bot)
+        message = None
+        if player.panel_message_id is not None:
+            try:
+                message = await channel.fetch_message(player.panel_message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                player.panel_message_id = None
+        try:
+            if message is None:
+                message = await channel.send(embed=embed, view=view)
+                player.panel_message_id = message.id
+            else:
+                await message.edit(embed=embed, view=view)
+            await self.persist(player)
+        except discord.Forbidden:
+            log.warning("cannot update music panel channel=%s (missing permissions)", player.text_channel_id)
+        except discord.HTTPException as exc:
+            log.warning("music panel update failed: %s", one_line(exc))
+
     async def notify(
         self, player: BotPlayer, content: str | None = None, *, embed: discord.Embed | None = None
     ) -> None:
@@ -1102,6 +1165,7 @@ class Music(commands.Cog):
             except Exception as exc:
                 log.warning("auto-pause unexpected error guild=%s err=%s", player.guild.id, one_line(exc))
                 return
+        await self.update_panel(player)
         await self.persist(player)
 
     # ---- source resolution -------------------------------------------------------------- #
@@ -1227,21 +1291,35 @@ class Music(commands.Cog):
 
     # ---- playback core ---------------------------------------------------------------------- #
     async def play_next(self, player: BotPlayer) -> bool:
-        if player.queue.is_empty:
-            return False
-        track = player.queue.get()
-        player.user_paused = False
-        try:
-            await player.play(track, volume=player.volume_pref, paused=bool(player.auto_pause_reasons))
-        except BaseException:
-            player.queue.put_at(0, track)
-            raise
-        return True
+        async with player.play_lock:
+            if player.current is not None or player.starting_track or player.queue.is_empty:
+                return False
+            track = player.queue.get()
+            player.user_paused = False
+            player.starting_track = True
+            try:
+                await player.play(track, volume=player.volume_pref, paused=bool(player.auto_pause_reasons))
+            except BaseException:
+                player.starting_track = False
+                player.queue.put_at(0, track)
+                raise
+            return True
 
     async def advance(self, player: BotPlayer, ended: wavelink.Playable | None, reason: str) -> None:
         guild = player.guild
         if guild is None or not player.connected or guild.id in self.bot.leaving:
             return
+        key = ((ended.identifier or ended.title) if ended else "unknown", reason)
+        now = time.monotonic()
+        if player.last_end_signature == key and now - player.last_end_at < 3:
+            log.warning("ignored duplicate track-end guild=%s track=%r reason=%s", guild.id, key[0], reason)
+            return
+        player.last_end_signature, player.last_end_at = key, now
+        current = player.current
+        if ended is not None and current is not None and current.identifier != ended.identifier:
+            log.warning("ignored stale track-end guild=%s ended=%r current=%r", guild.id, ended.title, current.title)
+            return
+        player.starting_track = False
         player.remember(ended)
 
         candidate: wavelink.Playable | None = None
@@ -1261,8 +1339,21 @@ class Music(commands.Cog):
                     break
                 track = player.queue.get()
             try:
-                player.user_paused = False
-                await player.play(track, volume=player.volume_pref, paused=bool(player.auto_pause_reasons))
+                async with player.play_lock:
+                    if player.starting_track:
+                        player.queue.put_at(0, track)
+                        return
+                    current = player.current
+                    if current is not None and ended is not None and current.identifier != ended.identifier:
+                        player.queue.put_at(0, track)
+                        return
+                    player.starting_track = True
+                    player.user_paused = False
+                    try:
+                        await player.play(track, volume=player.volume_pref, paused=bool(player.auto_pause_reasons))
+                    except BaseException:
+                        player.starting_track = False
+                        raise
                 return
             except wavelink.exceptions.LavalinkException as exc:
                 if is_stale_session(exc):
@@ -1276,7 +1367,7 @@ class Music(commands.Cog):
         if player.autoplay_enabled and ended is not None and await self.autoplay_next(player, ended):
             return
         if not player.autoplay_enabled:
-            await self.notify(player, "✅ Queue finished.")
+            await self.update_panel(player, status="Queue finished. Use .play to start another song.")
         self.schedule_idle(player)
         await self.persist(player)
 
@@ -1356,10 +1447,10 @@ class Music(commands.Cog):
         if not isinstance(player, BotPlayer) or player.guild is None:
             return
         track = payload.track
+        player.starting_track = False
         self.cancel_task(self.idle_tasks, player.guild.id)
         log.info("track started guild=%s title=%r source=%s", player.guild.id, track.title, track.source)
-        if not (player.loop_mode == "track" and player.last_started == track.identifier):
-            await self.notify(player, embed=self.now_playing_embed(player, track))
+        await self.update_panel(player, track=track)
         player.last_started = track.identifier
         await self.persist(player)
 
@@ -1369,6 +1460,7 @@ class Music(commands.Cog):
         if not isinstance(player, BotPlayer) or player.guild is None:
             return
         reason = (payload.reason or "").replace("_", "").lower()
+        player.starting_track = False
         if reason in ("replaced", "cleanup"):
             return
         if player.suppress_advance:
@@ -1455,8 +1547,8 @@ class Music(commands.Cog):
         if track.artwork:
             embed.set_thumbnail(url=track.artwork)
         embed.set_footer(
-            text=f"Volume {player.volume_pref}% • Loop: {player.loop_mode} • Filter: {player.filter_name}"
-            f" • Autoplay: {'on' if player.autoplay_enabled else 'off'}"
+            text=f"{'Paused' if player.paused else 'Playing'} • 24/7: {'on' if player.stay_247 else 'off'}"
+            f" • Volume {player.volume_pref}% • Loop: {player.loop_mode} • Filter: {player.filter_name}"
         )
         return embed
 
@@ -1522,39 +1614,27 @@ class Music(commands.Cog):
     async def help_command(self, ctx: Ctx) -> None:
         p = ctx.clean_prefix
         embed = discord.Embed(title="Music bot commands", color=EMBED_COLOR)
+        embed.add_field(name="Join", value=f"`{p}join` — join your voice channel and stay 24/7", inline=False)
+        embed.add_field(name="Play", value=f"`{p}play <song or link>` — play now or add it to the queue", inline=False)
+        embed.add_field(name="Stop", value=f"`{p}stop` — stop music and clear the queue", inline=False)
+        embed.add_field(name="Help", value=f"`{p}help` — show these commands", inline=False)
         embed.add_field(
-            name="Playback",
-            value=(
-                f"`{p}play <song/url>` `{p}pause` `{p}resume` `{p}skip` `{p}stop`\n"
-                f"`{p}seek <seconds>` `{p}volume <0-100>` `{p}nowplaying`"
-            ),
+            name="Player controls",
+            value="Use the buttons on the player panel for pause/resume, next, loop, volume, shuffle, and queue.",
             inline=False,
         )
-        embed.add_field(
-            name="Queue",
-            value=f"`{p}queue` `{p}shuffle` `{p}loop <track|queue|off>` `{p}autoplay <on|off>`",
-            inline=False,
-        )
-        embed.add_field(
-            name="Extras",
-            value=(
-                f"`{p}filter <name>` `{p}lyrics` `{p}247 <on|off>`\n"
-                f"`{p}playlist save|load|list|delete <name>`"
-            ),
-            inline=False,
-        )
-        embed.add_field(name="Voice", value=f"`{p}join` `{p}leave`", inline=False)
-        embed.set_footer(text="Sources: YouTube Music → SoundCloud → YouTube → yt-dlp")
+        embed.set_footer(text="Music pauses when the voice channel has no humans or the bot is server-muted/deafened.")
         await reply(ctx, embed=embed)
-
-    @commands.hybrid_command(name="join", aliases=["summon"], description="Join your voice channel")
+    @commands.hybrid_command(name="join", description="Join your voice channel and stay connected")
     async def join(self, ctx: Ctx) -> None:
         channel = self.user_voice_channel(ctx)
         player = await self.ensure_player(ctx, connect=True)
-        if player.current is None:
-            self.schedule_idle(player)
+        player.stay_247 = True
+        self.cancel_task(self.idle_tasks, ctx.guild.id)
+        self.cancel_task(self.empty_tasks, ctx.guild.id)
         await self.persist(player)
-        await reply(ctx, f"🔊 Joined {channel.mention}.")
+        await self.update_panel(player, status="Connected and staying in voice. Use .play to start music.")
+        await reply(ctx, f"🔊 Joined {channel.mention} and enabled 24/7 mode.")
 
     @commands.hybrid_command(name="leave", aliases=["disconnect", "dc"], description="Leave the voice channel")
     async def leave(self, ctx: Ctx) -> None:
@@ -1562,7 +1642,7 @@ class Music(commands.Cog):
         await self.leave_guild(ctx.guild)
         await reply(ctx, "👋 Left the voice channel.")
 
-    @commands.hybrid_command(name="play", aliases=["p"], description="Play a song or add it to the queue")
+    @commands.hybrid_command(name="play", description="Play a song or add it to the queue")
     async def play(self, ctx: Ctx, *, query: str) -> None:
         await ctx.defer()
         self.user_voice_channel(ctx)
@@ -1594,7 +1674,7 @@ class Music(commands.Cog):
                     ctx, f"📃 Queued **{len(tracks)}** tracks from **{discord.utils.escape_markdown(resolution.playlist_name)}**."
                 )
             elif was_idle:
-                await reply(ctx, f"▶️ Now playing {track_line(tracks[0])} *(via {resolution.source})*")
+                await reply(ctx, f"▶️ Starting {track_line(tracks[0])} *(via {resolution.source})*")
             else:
                 await reply(
                     ctx,
@@ -1628,8 +1708,10 @@ class Music(commands.Cog):
         except BaseException:
             player.suppress_advance = False
             raise
+        player.starting_track = False
         self.schedule_idle(player)
         await self.persist(player)
+        await self.update_panel(player, status="Stopped. Queue cleared. Use .play to start music.", force_status=True)
         await reply(ctx, "⏹️ Stopped and cleared the queue.")
 
     @commands.hybrid_command(name="skip", aliases=["s", "next"], description="Skip the current track")
@@ -1874,6 +1956,140 @@ class Music(commands.Cog):
         del playlists[key]
         await self.bot.store.flush()
         await reply(ctx, f"🗑️ Deleted playlist **{discord.utils.escape_markdown(key)}**.")
+
+
+class MusicControls(discord.ui.View):
+    """Persistent in-channel controls for the single music player."""
+
+    def __init__(self, bot: MusicBot) -> None:
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    async def get_player(
+        self, interaction: discord.Interaction
+    ) -> tuple[Music, BotPlayer] | None:
+        if interaction.guild is None:
+            await interaction.response.send_message("These controls only work in a server.", ephemeral=True)
+            return None
+        player = interaction.guild.voice_client
+        if not isinstance(player, BotPlayer) or not player.connected:
+            await interaction.response.send_message("The bot is not connected to voice.", ephemeral=True)
+            return None
+        user_voice = getattr(interaction.user, "voice", None)
+        if user_voice is None or user_voice.channel is None or user_voice.channel.id != player.channel.id:
+            await interaction.response.send_message("Join the bot's voice channel to use these controls.", ephemeral=True)
+            return None
+        music = self.bot.get_cog("Music")
+        if not isinstance(music, Music):
+            await interaction.response.send_message("The music player is restarting. Try again shortly.", ephemeral=True)
+            return None
+        await interaction.response.defer(ephemeral=True)
+        return music, player
+
+    @discord.ui.button(label="Pause / Resume", emoji="⏯️", style=discord.ButtonStyle.primary, custom_id="music:pause")
+    async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        result = await self.get_player(interaction)
+        if result is None:
+            return
+        music, player = result
+        if player.current is None:
+            await interaction.followup.send("Nothing is playing.", ephemeral=True)
+            return
+        if player.auto_pause_reasons:
+            player.user_paused = False
+            await music.update_panel(player)
+            await interaction.followup.send(f"Auto-pause is active: {music.pause_reason_text(player)}.", ephemeral=True)
+            return
+        player.user_paused = not player.user_paused
+        await player.pause(player.user_paused)
+        await music.persist(player)
+        await music.update_panel(player)
+        await interaction.followup.send("Paused." if player.user_paused else "Resumed.", ephemeral=True)
+
+    @discord.ui.button(label="Next", emoji="⏭️", style=discord.ButtonStyle.secondary, custom_id="music:next")
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        result = await self.get_player(interaction)
+        if result is None:
+            return
+        music, player = result
+        if player.current is None:
+            await interaction.followup.send("Nothing is playing.", ephemeral=True)
+            return
+        await player.skip(force=True)
+        await interaction.followup.send("Skipped to the next track.", ephemeral=True)
+
+    @discord.ui.button(label="Loop", emoji="🔁", style=discord.ButtonStyle.secondary, custom_id="music:loop")
+    async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        result = await self.get_player(interaction)
+        if result is None:
+            return
+        music, player = result
+        modes = ("off", "track", "queue")
+        player.loop_mode = modes[(modes.index(player.loop_mode) + 1) % len(modes)]
+        await music.persist(player)
+        await music.update_panel(player)
+        await interaction.followup.send(f"Loop mode: {player.loop_mode}.", ephemeral=True)
+
+    @discord.ui.button(label="Volume −", emoji="🔉", style=discord.ButtonStyle.secondary, custom_id="music:volume_down", row=1)
+    async def volume_down_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.change_volume(interaction, -10)
+
+    @discord.ui.button(label="Volume +", emoji="🔊", style=discord.ButtonStyle.secondary, custom_id="music:volume_up", row=1)
+    async def volume_up_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.change_volume(interaction, 10)
+
+    async def change_volume(self, interaction: discord.Interaction, delta: int) -> None:
+        result = await self.get_player(interaction)
+        if result is None:
+            return
+        music, player = result
+        player.volume_pref = max(0, min(100, player.volume_pref + delta))
+        if player.current is not None:
+            await player.set_volume(player.volume_pref)
+        await music.persist(player)
+        await music.update_panel(player)
+        await interaction.followup.send(f"Volume: {player.volume_pref}%.", ephemeral=True)
+
+    @discord.ui.button(label="Shuffle", emoji="🔀", style=discord.ButtonStyle.secondary, custom_id="music:shuffle", row=1)
+    async def shuffle_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        result = await self.get_player(interaction)
+        if result is None:
+            return
+        music, player = result
+        if player.queue.count < 2:
+            await interaction.followup.send("Queue at least two tracks to shuffle.", ephemeral=True)
+            return
+        player.queue.shuffle()
+        await music.persist(player)
+        await music.update_panel(player)
+        await interaction.followup.send("Queue shuffled.", ephemeral=True)
+
+    @discord.ui.button(label="Queue", emoji="📃", style=discord.ButtonStyle.secondary, custom_id="music:queue", row=1)
+    async def queue_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        result = await self.get_player(interaction)
+        if result is None:
+            return
+        _, player = result
+        lines = [f"Now: {track_line(player.current)}"] if player.current else []
+        lines.extend(f"{i}. {track_line(track)}" for i, track in enumerate(list(player.queue)[:10], 1))
+        await interaction.followup.send("\n".join(lines) if lines else "The queue is empty.", ephemeral=True)
+
+    @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger, custom_id="music:stop", row=1)
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        result = await self.get_player(interaction)
+        if result is None:
+            return
+        music, player = result
+        player.queue.clear()
+        player.loop_mode = "off"
+        player.fallbacks_tried.clear()
+        if player.current is not None:
+            player.suppress_advance = True
+            await player.skip(force=True)
+        player.starting_track = False
+        await music.persist(player)
+        await music.update_panel(player, status="Stopped. Queue cleared. Use .play to start music.", force_status=True)
+        await interaction.followup.send("Stopped and cleared the queue.", ephemeral=True)
 
 
 # --------------------------------------------------------------------------- #
