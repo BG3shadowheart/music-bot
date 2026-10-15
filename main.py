@@ -94,6 +94,7 @@ SEARCH_TIMEOUT = _env_float("SEARCH_TIMEOUT", 8.0)
 LAVALINK_TIMEOUT = _env_float("LAVALINK_TIMEOUT", 20.0)
 VOICE_CONNECT_TIMEOUT = _env_float("VOICE_CONNECT_TIMEOUT", 20.0)
 YTDLP_TIMEOUT = _env_float("YTDLP_TIMEOUT", 8.0)
+FALLBACK_SOURCE_TIMEOUT = _env_float("FALLBACK_SOURCE_TIMEOUT", 5.0)
 AUDIO_PROXY_PORT = max(1, min(65535, _env_int("AUDIO_PROXY_PORT", 8765)))
 AUDIO_PROXY_BIND = os.getenv("AUDIO_PROXY_BIND", "::")
 AUDIO_PROXY_BASE_URL = os.getenv("AUDIO_PROXY_BASE_URL", "").strip().rstrip("/")
@@ -1451,11 +1452,14 @@ class Music(commands.Cog):
             coro = wavelink.Playable.search(query)
         return await asyncio.wait_for(coro, timeout=SEARCH_TIMEOUT)
 
-    async def try_source(self, label: str, prefix: str | None, query: str) -> Resolution | None:
+    async def try_source(
+        self, label: str, prefix: str | None, query: str, *, timeout: float | None = None
+    ) -> Resolution | None:
+        source_timeout = SEARCH_TIMEOUT if timeout is None else max(0.1, timeout)
         try:
-            found = await self.lavalink_search(query, prefix)
+            found = await asyncio.wait_for(self.lavalink_search(query, prefix), timeout=source_timeout)
         except asyncio.TimeoutError:
-            log.debug("source=%s timed out after %.0fs", label, SEARCH_TIMEOUT)
+            log.debug("source=%s timed out after %.1fs", label, source_timeout)
             return None
         except wavelink.exceptions.LavalinkLoadException as exc:
             log.debug("source=%s failed: %s", label, one_line(exc))
@@ -1477,22 +1481,29 @@ class Music(commands.Cog):
         log.debug("source=%s returned no results", label)
         return None
 
-    async def ytdlp_extract(self, query: str) -> dict[str, Any] | None:
+    async def ytdlp_extract(self, query: str, *, timeout: float | None = None) -> dict[str, Any] | None:
+        source_timeout = YTDLP_TIMEOUT if timeout is None else max(0.1, timeout)
         try:
-            return await asyncio.wait_for(asyncio.to_thread(_ytdlp_extract_sync, query), timeout=YTDLP_TIMEOUT)
+            return await asyncio.wait_for(asyncio.to_thread(_ytdlp_extract_sync, query), timeout=source_timeout)
         except asyncio.TimeoutError:
-            log.debug("source=yt-dlp timed out after %.0fs", YTDLP_TIMEOUT)
+            log.debug("source=yt-dlp timed out after %.1fs", source_timeout)
         except Exception as exc:
             log.debug("source=yt-dlp failed: %s", one_line(exc))
         return None
 
-    async def ytdlp_to_resolution(self, info: dict[str, Any]) -> Resolution | None:
+    async def ytdlp_to_resolution(
+        self, info: dict[str, Any], *, timeout: float | None = None
+    ) -> Resolution | None:
         try:
             proxy_url = self.bot.register_audio_stream(info)
             if proxy_url is None:
                 log.warning("source=yt-dlp audio relay is unavailable")
                 return None
-            found = await self.lavalink_search(proxy_url, None)
+            search = self.lavalink_search(proxy_url, None)
+            if timeout is None:
+                found = await search
+            else:
+                found = await asyncio.wait_for(search, timeout=max(0.1, timeout))
         except UserFacingError:
             raise
         except Exception as exc:
@@ -1563,7 +1574,7 @@ class Music(commands.Cog):
                 f"{LAVALINK_URI}/youtube",
                 headers={"Authorization": LAVALINK_PASSWORD},
                 json={"refreshToken": token, "skipInitialization": True},
-                timeout=aiohttp.ClientTimeout(total=LAVALINK_TIMEOUT),
+                timeout=aiohttp.ClientTimeout(total=min(LAVALINK_TIMEOUT, FALLBACK_SOURCE_TIMEOUT)),
             ) as response:
                 if response.status == 204:
                     return True
@@ -1581,24 +1592,59 @@ class Music(commands.Cog):
         player.fallbacks_tried.add(key)
         query = f"{failed.title} {failed.author}".strip()
         signature = re.sub(r"[^a-z0-9]+", " ", query.casefold()).strip() or key.casefold()
-        if signature in player.fallback_queries_tried:
-            log.warning("fallbacks exhausted already for title=%r", failed.title)
-            return None, None
-        player.fallback_queries_tried.add(signature)
-        # Try the configured backup YouTube accounts before other providers.
-        # The main account stays in Lavalink's YOUTUBE_OAUTH_REFRESH_TOKEN variable;
-        # this bot-only variable contains up to two additional refresh tokens.
+
+        def mark_attempt(provider: str) -> bool:
+            marker = f"{signature}::{provider}"
+            if marker in player.fallback_queries_tried:
+                return False
+            # Record attempts per provider, not per song: if one fallback track also
+            # fails to stream, the next provider must still get a chance.
+            player.fallback_queries_tried.add(marker)
+            return True
+
+        # YouTube's hosted IP bot checks often reject every Lavalink client even
+        # when OAuth refresh succeeds. Move to a different provider first.
+        if mark_attempt("soundcloud"):
+            try:
+                result = await self.try_source(
+                    "SoundCloud", "scsearch", query, timeout=FALLBACK_SOURCE_TIMEOUT
+                )
+                if result:
+                    log.info("fallback resolved source=SoundCloud title=%r", failed.title)
+                    return result.tracks[0], None
+            except Exception as exc:
+                log.debug("SoundCloud fallback failed: %s", one_line(exc))
+
+        if mark_attempt("yt-dlp"):
+            try:
+                ytdlp_info = await self.ytdlp_extract(query, timeout=FALLBACK_SOURCE_TIMEOUT)
+                if ytdlp_info is not None:
+                    result = await self.ytdlp_to_resolution(
+                        ytdlp_info, timeout=FALLBACK_SOURCE_TIMEOUT
+                    )
+                    if result:
+                        log.info("fallback resolved source=yt-dlp title=%r", failed.title)
+                        return result.tracks[0], None
+            except Exception as exc:
+                log.debug("yt-dlp fallback failed: %s", one_line(exc))
+
+        # Keep the additional OAuth accounts as last-resort YouTube retries. Each
+        # account is tried at most once for this song, so failures advance cleanly.
         tokens = YOUTUBE_OAUTH_FALLBACK_TOKENS
         if tokens:
             start = self.youtube_fallback_cursor % len(tokens)
             for offset in range(len(tokens)):
                 index = (start + offset) % len(tokens)
+                if not mark_attempt(f"youtube-backup-{index + 1}"):
+                    continue
                 token = tokens[index]
                 try:
                     async with self.youtube_auth_lock:
                         if not await self.activate_youtube_fallback_token(token):
                             continue
-                        result = await self.try_source("YouTube backup", "ytsearch", query)
+                        result = await self.try_source(
+                            "YouTube backup", "ytsearch", query, timeout=FALLBACK_SOURCE_TIMEOUT
+                        )
                 except Exception as exc:
                     log.debug("YouTube backup search failed: %s", one_line(exc))
                     continue
@@ -1607,27 +1653,7 @@ class Music(commands.Cog):
                     log.info("fallback resolved source=YouTube backup account=%d title=%r", index + 1, failed.title)
                     return result.tracks[0], token
 
-        # SoundCloud avoids the YouTube login challenge and is tried quickly.
-        try:
-            result = await self.try_source("SoundCloud", "scsearch", query)
-            if result:
-                log.info("fallback resolved source=SoundCloud title=%r", failed.title)
-                return result.tracks[0], None
-        except Exception as exc:
-            log.debug("SoundCloud fallback failed: %s", one_line(exc))
-
-        # yt-dlp is last because hosted IPs can be blocked by YouTube's bot checks.
-        try:
-            ytdlp_info = await self.ytdlp_extract(query)
-            if ytdlp_info is not None:
-                result = await self.ytdlp_to_resolution(ytdlp_info)
-                if result:
-                    log.info("fallback resolved source=yt-dlp title=%r", failed.title)
-                    return result.tracks[0], None
-        except Exception as exc:
-            log.debug("yt-dlp fallback failed: %s", one_line(exc))
-
-        log.warning("no fallback source resolved title=%r", failed.title)
+        log.warning("fallback providers exhausted title=%r", failed.title)
         return None, None
 
     # ---- playback core ---------------------------------------------------------------------- #
