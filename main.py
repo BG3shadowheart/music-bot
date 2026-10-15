@@ -99,7 +99,7 @@ MAX_PLAYLISTS_PER_USER = 25
 MAX_PLAYLIST_TRACKS = 200
 MIN_LAVALINK = (4, 2, 2)
 URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
-EMBED_COLOR = 0xF4A7C7
+EMBED_COLOR = 0x000000
 VOICE_REGION = "singapore"
 IDLE_BITRATE = 64_000
 PLAYBACK_BITRATE = 384_000
@@ -1280,7 +1280,7 @@ class Music(commands.Cog):
             try:
                 previous = await channel.fetch_message(player.panel_message_id)
                 await previous.edit(
-                    content="🎵 The active player controls are in the latest player panel below.",
+                    content="🎀 A new song is on its way! Use the newest player panel below ♡",
                     embed=None,
                     view=None,
                 )
@@ -1292,17 +1292,17 @@ class Music(commands.Cog):
             embed = self.now_playing_embed(player, current)
         else:
             embed = discord.Embed(
-                title="🎀 ABN Music Lounge",
-                description=status or "♡ Nothing is playing yet. Add a song whenever you're ready!",
+                title="୨୧ 🎀 ABN Music Lounge 🎀 ୨୧",
+                description=status or "♡₊˚ Nothing is playing yet. Add a song whenever you're ready!",
                 color=EMBED_COLOR,
             )
             if self.bot.user:
-                embed.set_author(name="ABN Music • Anime Radio", icon_url=self.bot.user.display_avatar.url)
+                embed.set_author(name="୨୧ ABN Music • Anime Radio ୨୧", icon_url=self.bot.user.display_avatar.url)
             embed.set_footer(text=f"♡ 24/7 {'on' if player.stay_247 else 'off'}  •  🔊 {player.volume_pref}%")
         upcoming = list(player.queue)[:5]
         if upcoming:
             embed.add_field(
-                name="Up next",
+                name="🍓 Up next",
                 value="\n".join(f"{index}. {track_line(item)}" for index, item in enumerate(upcoming, 1))[:1024],
                 inline=False,
             )
@@ -1587,6 +1587,7 @@ class Music(commands.Cog):
             player.user_paused = False
             player.starting_track = True
             try:
+                await self.update_panel(player, track=track, refresh=True)
                 await player.play(track, volume=player.volume_pref, paused=bool(player.auto_pause_reasons))
             except BaseException:
                 player.starting_track = False
@@ -1639,6 +1640,7 @@ class Music(commands.Cog):
                     player.starting_track = True
                     player.user_paused = False
                     try:
+                        await self.update_panel(player, track=track, refresh=True)
                         await player.play(track, volume=player.volume_pref, paused=bool(player.auto_pause_reasons))
                     except BaseException:
                         player.starting_track = False
@@ -1849,17 +1851,17 @@ class Music(commands.Cog):
     # ---- embeds --------------------------------------------------------------------------------- #
     def now_playing_embed(self, player: BotPlayer, track: wavelink.Playable) -> discord.Embed:
         embed = discord.Embed(
-            title="🎀 Now Playing",
-            description=f"♡ {track_line(track)}",
+            title="୨୧ 🎀 Now Playing 🎀 ୨୧",
+            description=f"♡₊˚ {track_line(track)}",
             color=EMBED_COLOR,
         )
         if self.bot.user:
-            embed.set_author(name="ABN Music • Anime Radio", icon_url=self.bot.user.display_avatar.url)
+            embed.set_author(name="୨୧ ABN Music • Anime Radio ୨୧", icon_url=self.bot.user.display_avatar.url)
         else:
-            embed.set_author(name="ABN Music • Anime Radio")
+            embed.set_author(name="୨୧ ABN Music • Anime Radio ୨୧")
         artist = discord.utils.escape_markdown(track.author or "Unknown artist")
-        embed.add_field(name="🎤 Artist", value=artist, inline=True)
-        embed.add_field(name="⏱️ Length", value="LIVE" if track.is_stream else fmt_ms(track.length), inline=True)
+        embed.add_field(name="🌷 Artist", value=artist, inline=True)
+        embed.add_field(name="⏳ Length", value="LIVE" if track.is_stream else fmt_ms(track.length), inline=True)
         source_key = str(track.source or "unknown").lower()
         source_name = {
             "youtube": "YouTube",
@@ -2334,7 +2336,7 @@ class MusicControls(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         return music, player
 
-    @discord.ui.button(label="Pause / Resume", emoji="⏯️", style=discord.ButtonStyle.primary, custom_id="music:pause")
+    @discord.ui.button(label="Pause / Resume", emoji="🌸", style=discord.ButtonStyle.primary, custom_id="music:pause")
     async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         result = await self.get_player(interaction)
         if result is None:
@@ -2354,7 +2356,7 @@ class MusicControls(discord.ui.View):
         await music.update_panel(player)
         await interaction.followup.send("Paused." if player.user_paused else "Resumed.", ephemeral=True)
 
-    @discord.ui.button(label="Next", emoji="⏭️", style=discord.ButtonStyle.secondary, custom_id="music:next")
+    @discord.ui.button(label="Next", emoji="🍓", style=discord.ButtonStyle.secondary, custom_id="music:next")
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         result = await self.get_player(interaction)
         if result is None:
@@ -2366,7 +2368,7 @@ class MusicControls(discord.ui.View):
         await player.skip(force=True)
         await interaction.followup.send("Skipped to the next track.", ephemeral=True)
 
-    @discord.ui.button(label="Loop", emoji="🔁", style=discord.ButtonStyle.secondary, custom_id="music:loop")
+    @discord.ui.button(label="Loop", emoji="🎀", style=discord.ButtonStyle.secondary, custom_id="music:loop")
     async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         result = await self.get_player(interaction)
         if result is None:
@@ -2378,11 +2380,11 @@ class MusicControls(discord.ui.View):
         await music.update_panel(player)
         await interaction.followup.send(f"Loop mode: {player.loop_mode}.", ephemeral=True)
 
-    @discord.ui.button(label="Volume −", emoji="🔉", style=discord.ButtonStyle.secondary, custom_id="music:volume_down", row=1)
+    @discord.ui.button(label="Volume −", emoji="🌷", style=discord.ButtonStyle.secondary, custom_id="music:volume_down", row=1)
     async def volume_down_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.change_volume(interaction, -10)
 
-    @discord.ui.button(label="Volume +", emoji="🔊", style=discord.ButtonStyle.secondary, custom_id="music:volume_up", row=1)
+    @discord.ui.button(label="Volume +", emoji="💗", style=discord.ButtonStyle.secondary, custom_id="music:volume_up", row=1)
     async def volume_up_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.change_volume(interaction, 10)
 
@@ -2398,7 +2400,7 @@ class MusicControls(discord.ui.View):
         await music.update_panel(player)
         await interaction.followup.send(f"Volume: {player.volume_pref}%.", ephemeral=True)
 
-    @discord.ui.button(label="Shuffle", emoji="🔀", style=discord.ButtonStyle.secondary, custom_id="music:shuffle", row=1)
+    @discord.ui.button(label="Shuffle", emoji="✨", style=discord.ButtonStyle.secondary, custom_id="music:shuffle", row=1)
     async def shuffle_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         result = await self.get_player(interaction)
         if result is None:
@@ -2412,7 +2414,7 @@ class MusicControls(discord.ui.View):
         await music.update_panel(player)
         await interaction.followup.send("Queue shuffled.", ephemeral=True)
 
-    @discord.ui.button(label="Queue", emoji="📃", style=discord.ButtonStyle.secondary, custom_id="music:queue", row=1)
+    @discord.ui.button(label="Queue", emoji="📜", style=discord.ButtonStyle.secondary, custom_id="music:queue", row=1)
     async def queue_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         result = await self.get_player(interaction)
         if result is None:
@@ -2422,7 +2424,7 @@ class MusicControls(discord.ui.View):
         lines.extend(f"{i}. {track_line(track)}" for i, track in enumerate(list(player.queue)[:10], 1))
         await interaction.followup.send("\n".join(lines) if lines else "The queue is empty.", ephemeral=True)
 
-    @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger, custom_id="music:stop", row=1)
+    @discord.ui.button(label="Stop", emoji="🧸", style=discord.ButtonStyle.danger, custom_id="music:stop", row=1)
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         result = await self.get_player(interaction)
         if result is None:
