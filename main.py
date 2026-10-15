@@ -83,10 +83,10 @@ SYNC_SLASH = os.getenv("SYNC_SLASH_COMMANDS", "true").lower() in ("1", "true", "
 YTDLP_COOKIES = os.getenv("YTDLP_COOKIES_FILE", "")
 
 DEFAULT_VOLUME = max(0, min(100, _env_int("DEFAULT_VOLUME", 60)))
-SEARCH_TIMEOUT = _env_float("SEARCH_TIMEOUT", 12.0)
+SEARCH_TIMEOUT = _env_float("SEARCH_TIMEOUT", 8.0)
 LAVALINK_TIMEOUT = _env_float("LAVALINK_TIMEOUT", 20.0)
 VOICE_CONNECT_TIMEOUT = _env_float("VOICE_CONNECT_TIMEOUT", 20.0)
-YTDLP_TIMEOUT = _env_float("YTDLP_TIMEOUT", 30.0)
+YTDLP_TIMEOUT = _env_float("YTDLP_TIMEOUT", 8.0)
 IDLE_TIMEOUT = _env_int("IDLE_TIMEOUT_SECONDS", 300)
 EMPTY_LEAVE_SECONDS = _env_int("EMPTY_LEAVE_SECONDS", 600)  # 0 = never leave an empty channel
 MAX_QUEUE = 500
@@ -407,8 +407,8 @@ class SourceSpec(NamedTuple):
 
 SOURCE_CHAIN: tuple[SourceSpec, ...] = (
     SourceSpec("YouTube Music", "ytmsearch", "youtube"),
-    SourceSpec("SoundCloud", "scsearch", "soundcloud"),
     SourceSpec("YouTube", "ytsearch", "youtube"),
+    SourceSpec("SoundCloud", "scsearch", "soundcloud"),
 )
 
 
