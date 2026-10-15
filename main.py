@@ -82,7 +82,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 SYNC_SLASH = os.getenv("SYNC_SLASH_COMMANDS", "true").lower() in ("1", "true", "yes", "on")
 YTDLP_COOKIES = os.getenv("YTDLP_COOKIES_FILE", "")
 
-DEFAULT_VOLUME = max(0, min(100, _env_int("DEFAULT_VOLUME", 60)))
+DEFAULT_VOLUME = max(0, min(1000, _env_int("DEFAULT_VOLUME", 200)))
 SEARCH_TIMEOUT = _env_float("SEARCH_TIMEOUT", 8.0)
 LAVALINK_TIMEOUT = _env_float("LAVALINK_TIMEOUT", 20.0)
 VOICE_CONNECT_TIMEOUT = _env_float("VOICE_CONNECT_TIMEOUT", 20.0)
@@ -388,6 +388,7 @@ def snapshot_player(player: BotPlayer, previous: dict[str, Any] | None = None) -
         "user_paused": player.user_paused,
         "queue": queue_raw,
         "volume": player.volume_pref,
+        "volume_max": 1000,
         "loop": player.loop_mode,
         "stay_247": player.stay_247,
         "autoplay": player.autoplay_enabled,
@@ -854,7 +855,15 @@ class Music(commands.Cog):
         player.autoplay_enabled = bool(data.get("autoplay"))
         player.loop_mode = data.get("loop") if data.get("loop") in ("off", "track", "queue") else "off"
         player.filter_name = data.get("filter") if data.get("filter") in get_args(FilterName) else "off"
-        player.volume_pref = max(0, min(100, int(data.get("volume", DEFAULT_VOLUME))))
+        raw_volume = data.get("volume", DEFAULT_VOLUME)
+        if data.get("volume_max") != 1000:
+            # Upgrade saved pre-1000 states to the user's requested new default once.
+            raw_volume = DEFAULT_VOLUME
+        try:
+            raw_volume = int(raw_volume)
+        except (TypeError, ValueError):
+            raw_volume = DEFAULT_VOLUME
+        player.volume_pref = max(0, min(1000, raw_volume))
         player.text_channel_id = data.get("text_channel_id")
         try:
             player.panel_message_id = int(data.get("panel_message_id")) if data.get("panel_message_id") else None
@@ -1023,10 +1032,27 @@ class Music(commands.Cog):
         status: str | None = None,
         force_status: bool = False,
     ) -> None:
-        if player.guild is None or player.text_channel_id is None:
+        if player.guild is None:
+            log.warning("music panel unavailable: player has no guild")
+            return
+        if player.text_channel_id is None:
+            log.warning("music panel unavailable guild=%s: no command channel is saved", player.guild.id)
             return
         channel = self.bot.get_channel(player.text_channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(player.text_channel_id)
+            except discord.Forbidden:
+                log.warning("cannot read music panel channel=%s (missing permissions)", player.text_channel_id)
+                return
+            except discord.NotFound:
+                log.warning("music panel channel=%s no longer exists", player.text_channel_id)
+                return
+            except discord.HTTPException as exc:
+                log.warning("could not fetch music panel channel=%s err=%s", player.text_channel_id, one_line(exc))
+                return
         if not isinstance(channel, discord.abc.Messageable):
+            log.warning("music panel unavailable channel=%s: channel is not messageable", player.text_channel_id)
             return
         current = track if track is not None else (None if force_status else player.current)
         if current is not None:
@@ -1052,8 +1078,10 @@ class Music(commands.Cog):
             if message is None:
                 message = await channel.send(embed=embed, view=view)
                 player.panel_message_id = message.id
+                log.info("music panel posted guild=%s channel=%s message=%s", player.guild.id, player.text_channel_id, message.id)
             else:
                 await message.edit(embed=embed, view=view)
+                log.info("music panel updated guild=%s channel=%s message=%s", player.guild.id, player.text_channel_id, message.id)
             await self.persist(player)
         except discord.Forbidden:
             log.warning("cannot update music panel channel=%s (missing permissions)", player.text_channel_id)
@@ -1447,6 +1475,7 @@ class Music(commands.Cog):
         if not isinstance(player, BotPlayer) or player.guild is None:
             return
         track = payload.track
+        player.fallbacks_tried.discard(track.identifier or track.title)
         player.starting_track = False
         self.cancel_task(self.idle_tasks, player.guild.id)
         log.info("track started guild=%s title=%r source=%s", player.guild.id, track.title, track.source)
@@ -1460,6 +1489,10 @@ class Music(commands.Cog):
         if not isinstance(player, BotPlayer) or player.guild is None:
             return
         reason = (payload.reason or "").replace("_", "").lower()
+        failed_key = payload.track.identifier or payload.track.title
+        if reason in ("finished", "loadfailed") and failed_key in player.fallbacks_tried:
+            log.info("ignored track end after failure recovery guild=%s title=%r reason=%s", player.guild.id, payload.track.title, reason)
+            return
         player.starting_track = False
         if reason in ("replaced", "cleanup"):
             return
@@ -1483,6 +1516,18 @@ class Music(commands.Cog):
             payload.track.source,
             one_line(str(payload.exception)),
         )
+        if not isinstance(player, BotPlayer) or player.guild is None or player.guild.id in self.bot.leaving:
+            return
+        failed_key = payload.track.identifier or payload.track.title
+        if failed_key in player.fallbacks_tried:
+            return
+        try:
+            # Some source failures arrive as TrackException without a useful load-failed
+            # TrackEnd event. Advance here as well; fallbacks_tried deduplicates both paths.
+            await self.advance(player, payload.track, "loadfailed")
+        except Exception as exc:
+            log.error("track exception recovery failed guild=%s err=%s", player.guild.id, one_line(exc))
+            await self.update_panel(player, status="Track failed. Use .play to try again.", force_status=True)
 
     @commands.Cog.listener()
     async def on_wavelink_track_stuck(self, payload: wavelink.TrackStuckEventPayload) -> None:
@@ -1672,6 +1717,10 @@ class Music(commands.Cog):
                 await self.guarded(ctx, self.play_next, what="play")
             player = self.player_of(ctx)
             await self.persist(player)
+            await self.update_panel(
+                player,
+                status="Connected. Waiting for playback." if player.current is None else None,
+            )
             self.cancel_task(self.idle_tasks, ctx.guild.id)
             if resolution.playlist_name:
                 await reply(
@@ -1784,14 +1833,14 @@ class Music(commands.Cog):
             embed.add_field(name="Progress", value=f"`{fmt_ms(position)}` {bar} `{fmt_ms(track.length)}`", inline=False)
         await reply(ctx, embed=embed)
 
-    @commands.hybrid_command(name="volume", aliases=["vol"], description="Show or set the volume (0-100)")
+    @commands.hybrid_command(name="volume", aliases=["vol"], description="Show or set the volume (0-1000)")
     async def volume(self, ctx: Ctx, level: Optional[int] = None) -> None:
         player = await self.ensure_player(ctx, connect=False)
         if level is None:
             await reply(ctx, f"🔉 Volume is **{player.volume_pref}%**.")
             return
-        if not 0 <= level <= 100:
-            raise UserFacingError("Volume must be between 0 and 100.")
+        if not 0 <= level <= 1000:
+            raise UserFacingError("Volume must be between 0 and 1000.")
         player.volume_pref = level
         if player.current is not None:
             await self.guarded(ctx, lambda p: p.set_volume(level), what="volume")
@@ -2047,7 +2096,7 @@ class MusicControls(discord.ui.View):
         if result is None:
             return
         music, player = result
-        player.volume_pref = max(0, min(100, player.volume_pref + delta))
+        player.volume_pref = max(0, min(1000, player.volume_pref + delta))
         if player.current is not None:
             await player.set_volume(player.volume_pref)
         await music.persist(player)
