@@ -94,7 +94,7 @@ SEARCH_TIMEOUT = _env_float("SEARCH_TIMEOUT", 8.0)
 LAVALINK_TIMEOUT = _env_float("LAVALINK_TIMEOUT", 20.0)
 VOICE_CONNECT_TIMEOUT = _env_float("VOICE_CONNECT_TIMEOUT", 20.0)
 YTDLP_TIMEOUT = _env_float("YTDLP_TIMEOUT", 8.0)
-FALLBACK_SOURCE_TIMEOUT = _env_float("FALLBACK_SOURCE_TIMEOUT", 3.0)
+FALLBACK_SOURCE_TIMEOUT = _env_float("FALLBACK_SOURCE_TIMEOUT", 5.0)
 AUDIO_PROXY_PORT = max(1, min(65535, _env_int("AUDIO_PROXY_PORT", 8765)))
 AUDIO_PROXY_BIND = os.getenv("AUDIO_PROXY_BIND", "::")
 AUDIO_PROXY_BASE_URL = os.getenv("AUDIO_PROXY_BASE_URL", "").strip().rstrip("/")
@@ -340,6 +340,7 @@ class BotPlayer(wavelink.Player):
         self.pause_lock = asyncio.Lock()
         self.play_lock = asyncio.Lock()
         self.starting_track: bool = False
+        self.stream_status: str = "idle"
         self.panel_message_id: int | None = None
         self.panel_lock = asyncio.Lock()
         self.last_end_signature: tuple[str, str] | None = None
@@ -1740,11 +1741,13 @@ class Music(commands.Cog):
             track = player.queue.get()
             player.user_paused = False
             player.starting_track = True
+            player.stream_status = "starting"
             try:
                 await self.update_panel(player, track=track, refresh=True)
                 await player.play(track, volume=player.volume_pref, paused=bool(player.auto_pause_reasons))
             except BaseException:
                 player.starting_track = False
+                player.stream_status = "idle"
                 player.queue.put_at(0, track)
                 raise
             return True
@@ -1765,6 +1768,13 @@ class Music(commands.Cog):
             return
         player.starting_track = False
         player.remember(ended)
+        if reason == "loadfailed":
+            player.stream_status = "recovering"
+            await self.update_panel(
+                player,
+                status="Finding another playable audio source…",
+                force_status=True,
+            )
 
         candidate: wavelink.Playable | None = None
         if ended is not None and reason == "finished" and player.loop_mode == "track":
@@ -1792,12 +1802,14 @@ class Music(commands.Cog):
                         player.queue.put_at(0, track)
                         return
                     player.starting_track = True
+                    player.stream_status = "starting"
                     player.user_paused = False
                     try:
                         await self.update_panel(player, track=track, refresh=True)
                         await player.play(track, volume=player.volume_pref, paused=bool(player.auto_pause_reasons))
                     except BaseException:
                         player.starting_track = False
+                        player.stream_status = "idle"
                         raise
                 return
             except wavelink.exceptions.LavalinkException as exc:
@@ -1811,10 +1823,31 @@ class Music(commands.Cog):
 
         if player.autoplay_enabled and ended is not None and await self.autoplay_next(player, ended):
             return
-        if not player.autoplay_enabled:
-            await self.apply_voice_channel_settings(player, playing=False)
-            await self.update_panel(player, status="Queue finished. Use .play to start another song.")
+        player.stream_status = "idle"
+        await self.apply_voice_channel_settings(player, playing=False)
+        status = (
+            "Unable to start this track from available sources. Try another song."
+            if reason == "loadfailed"
+            else "Queue finished. Use .play to start another song."
+        )
+        await self.update_panel(player, status=status, force_status=True)
         self.schedule_idle(player)
+        await self.persist(player)
+
+    async def confirm_track_start(self, player: BotPlayer, track: wavelink.Playable) -> None:
+        """Wait out Lavalink's quick source failures before showing a track as playing."""
+        await asyncio.sleep(6)
+        current = player.current
+        if (
+            player.guild is None
+            or current is None
+            or player.stream_status != "starting"
+            or (current.identifier or current.title) != (track.identifier or track.title)
+        ):
+            return
+        player.stream_status = "playing"
+        log.info("track remained active after startup window guild=%s title=%r", player.guild.id, track.title)
+        await self.update_panel(player, track=current)
         await self.persist(player)
 
     async def autoplay_next(self, player: BotPlayer, seed: wavelink.Playable) -> bool:
@@ -1894,12 +1927,14 @@ class Music(commands.Cog):
             return
         track = payload.track
         player.starting_track = False
+        player.stream_status = "starting"
         self.cancel_task(self.idle_tasks, player.guild.id)
-        log.info("track started guild=%s title=%r source=%s", player.guild.id, track.title, track.source)
+        log.info("track start received guild=%s title=%r source=%s; verifying stream", player.guild.id, track.title, track.source)
         await self.apply_voice_channel_settings(player, playing=True)
         await self.update_panel(player, track=track)
         player.last_started = track.identifier
         await self.persist(player)
+        self.spawn(self.confirm_track_start(player, track))
 
     @commands.Cog.listener()
     async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload) -> None:
@@ -1936,16 +1971,26 @@ class Music(commands.Cog):
         )
         if not isinstance(player, BotPlayer) or player.guild is None or player.guild.id in self.bot.leaving:
             return
+        current = player.current
+        if current is not None and (current.identifier or current.title) != (payload.track.identifier or payload.track.title):
+            log.info("ignored stale track exception guild=%s title=%r", player.guild.id, payload.track.title)
+            return
         failed_key = payload.track.identifier or payload.track.title
         if failed_key in player.fallbacks_tried:
             return
+        player.stream_status = "recovering"
         try:
             # Some source failures arrive as TrackException without a useful load-failed
             # TrackEnd event. Advance here as well; fallbacks_tried deduplicates both paths.
             await self.advance(player, payload.track, "loadfailed")
         except Exception as exc:
             log.error("track exception recovery failed guild=%s err=%s", player.guild.id, one_line(exc))
-            await self.update_panel(player, status="Track failed. Use .play to try again.", force_status=True)
+            player.stream_status = "idle"
+            await self.update_panel(
+                player,
+                status="Unable to start this track from available sources. Try another song.",
+                force_status=True,
+            )
 
     @commands.Cog.listener()
     async def on_wavelink_track_stuck(self, payload: wavelink.TrackStuckEventPayload) -> None:
@@ -1956,6 +2001,7 @@ class Music(commands.Cog):
         if current is not None and current.identifier != payload.track.identifier:
             log.info("ignored stale stuck event guild=%s title=%r", player.guild.id, payload.track.title)
             return
+        player.stream_status = "recovering"
         threshold = getattr(payload, "threshold_ms", None)
         log.warning(
             "track stuck guild=%s title=%r threshold_ms=%s; trying fallback",
@@ -2013,8 +2059,12 @@ class Music(commands.Cog):
 
     # ---- embeds --------------------------------------------------------------------------------- #
     def now_playing_embed(self, player: BotPlayer, track: wavelink.Playable) -> discord.Embed:
+        is_starting = player.stream_status in {"starting", "recovering"}
+        playback_label = (
+            "Starting audio" if is_starting else "Paused" if player.paused else "Playing"
+        )
         embed = discord.Embed(
-            title="୨୧ 🎀 Now Playing 🎀 ୨୧",
+            title=("୨୧ 🎀 Starting audio… 🎀 ୨୧" if is_starting else "୨୧ 🎀 Now Playing 🎀 ୨୧"),
             description=f"♡₊˚ {track_line(track)}",
             color=EMBED_COLOR,
         )
@@ -2037,7 +2087,7 @@ class Music(commands.Cog):
         if track.artwork:
             embed.set_thumbnail(url=track.artwork)
         embed.set_footer(
-            text=f"♡ {'Paused' if player.paused else 'Playing'}"
+            text=f"♡ {playback_label}"
             f"  •  24/7 {'on' if player.stay_247 else 'off'}"
             f"  •  🔊 {player.volume_pref}%"
             f"  •  Loop {player.loop_mode}"
@@ -2221,6 +2271,7 @@ class Music(commands.Cog):
             player.suppress_advance = False
             raise
         player.starting_track = False
+        player.stream_status = "idle"
         await self.apply_voice_channel_settings(player, playing=False)
         self.schedule_idle(player)
         await self.persist(player)
@@ -2600,6 +2651,7 @@ class MusicControls(discord.ui.View):
             player.suppress_advance = True
             await player.skip(force=True)
         player.starting_track = False
+        player.stream_status = "idle"
         await music.apply_voice_channel_settings(player, playing=False)
         await music.persist(player)
         await music.update_panel(player, status="Stopped. Queue cleared. Use .play to start music.", force_status=True)
