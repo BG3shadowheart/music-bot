@@ -60,6 +60,8 @@ def _parse_ids(raw: str) -> set[int]:
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 SIBLING_BOT_IDS = _parse_ids(os.getenv("SIBLING_BOT_IDS", ""))
+
+
 def _normalize_lavalink_uri(raw: str) -> str:
     uri = raw.strip() or "http://localhost:2333"
     if "://" not in uri:
