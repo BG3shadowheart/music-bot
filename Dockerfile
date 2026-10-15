@@ -17,6 +17,5 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY main.py .
 
 RUN mkdir -p /data
-VOLUME ["/data"]
 
 CMD ["python", "main.py"]
