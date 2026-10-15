@@ -83,6 +83,11 @@ BOT_PREFIX = os.getenv("BOT_PREFIX", ".")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 SYNC_SLASH = os.getenv("SYNC_SLASH_COMMANDS", "true").lower() in ("1", "true", "yes", "on")
 YTDLP_COOKIES = os.getenv("YTDLP_COOKIES_FILE", "")
+YOUTUBE_OAUTH_FALLBACK_TOKENS = tuple(
+    token.strip()
+    for token in os.getenv("YOUTUBE_OAUTH_FALLBACK_TOKENS", "").replace("\n", ",").split(",")
+    if token.strip()
+)[:2]
 
 DEFAULT_VOLUME = max(0, min(1000, _env_int("DEFAULT_VOLUME", 120)))
 SEARCH_TIMEOUT = _env_float("SEARCH_TIMEOUT", 8.0)
@@ -741,6 +746,19 @@ class Music(commands.Cog):
         self.empty_tasks: dict[int, asyncio.Task[None]] = {}
         self.node_task: asyncio.Task[None] | None = None
         self.background: set[asyncio.Task[Any]] = set()
+        self.youtube_auth_lock = asyncio.Lock()
+        self.youtube_fallback_cursor = 0
+        self.spotify_config_lock = asyncio.Lock()
+        self.spotify_credentials: list[tuple[str, str]] = []
+        for id_name, secret_name in (
+            ("LAVASRC_SPOTIFY_CLIENT_ID", "LAVASRC_SPOTIFY_CLIENT_SECRET"),
+            ("LAVASRC_SPOTIFY_CLIENT_ID_FALLBACK", "LAVASRC_SPOTIFY_CLIENT_SECRET_FALLBACK"),
+        ):
+            client_id = os.getenv(id_name, "").strip()
+            client_secret = os.getenv(secret_name, "").strip()
+            if client_id and client_secret and (client_id, client_secret) not in self.spotify_credentials:
+                self.spotify_credentials.append((client_id, client_secret))
+        self.spotify_active_index = 0
 
     # ---- lifecycle ---------------------------------------------------------- #
     def spawn(self, coro: Awaitable[Any]) -> asyncio.Task[Any]:
@@ -1482,6 +1500,64 @@ class Music(commands.Cog):
         log.debug("source=%s returned no results", label)
         return None
 
+    async def set_spotify_credentials(self, client_id: str, client_secret: str) -> bool:
+        """Switch LavaSrc's Spotify app without logging either credential."""
+        session = self.bot.session
+        if session is None or session.closed:
+            return False
+        try:
+            async with session.patch(
+                f"{LAVALINK_URI}/v4/lavasrc/config",
+                headers={"Authorization": LAVALINK_PASSWORD},
+                json={"spotify": {"clientId": client_id, "clientSecret": client_secret}},
+                timeout=aiohttp.ClientTimeout(total=min(LAVALINK_TIMEOUT, 10.0)),
+            ) as response:
+                if 200 <= response.status < 300:
+                    return True
+                log.warning("LavaSrc rejected Spotify credential switch status=%s", response.status)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            log.warning("LavaSrc Spotify credential switch failed: %s", one_line(exc))
+        return False
+
+    async def try_spotify(self, query: str, *, direct_url: bool = False) -> Resolution | None:
+        """Try the configured Spotify app, then its backup app if needed."""
+        if not self.spotify_credentials:
+            return await self.try_source("Spotify", None if direct_url else "spsearch", query)
+
+        async with self.spotify_config_lock:
+            start = self.spotify_active_index % len(self.spotify_credentials)
+            for offset in range(len(self.spotify_credentials)):
+                index = (start + offset) % len(self.spotify_credentials)
+                client_id, client_secret = self.spotify_credentials[index]
+                if not await self.set_spotify_credentials(client_id, client_secret):
+                    continue
+                result = await self.try_source("Spotify", None if direct_url else "spsearch", query)
+                if result:
+                    self.spotify_active_index = index
+                    log.info("Spotify search succeeded with credential slot=%d", index + 1)
+                    return result
+                log.info("Spotify credential slot=%d returned no result; trying backup", index + 1)
+        return None
+
+    async def activate_youtube_fallback_token(self, token: str) -> bool:
+        """Select a backup YouTube account on Lavalink without logging its token."""
+        session = self.bot.session
+        if session is None or session.closed:
+            return False
+        try:
+            async with session.post(
+                f"{LAVALINK_URI}/youtube",
+                headers={"Authorization": LAVALINK_PASSWORD},
+                json={"refreshToken": token, "skipInitialization": True},
+                timeout=aiohttp.ClientTimeout(total=min(LAVALINK_TIMEOUT, FALLBACK_SOURCE_TIMEOUT)),
+            ) as response:
+                if response.status == 204:
+                    return True
+                log.warning("YouTube backup account was rejected by Lavalink status=%s", response.status)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            log.warning("YouTube backup account switch failed: %s", one_line(exc))
+        return False
+
     async def ytdlp_extract(self, query: str, *, timeout: float | None = None) -> dict[str, Any] | None:
         source_timeout = YTDLP_TIMEOUT if timeout is None else max(0.1, timeout)
         try:
@@ -1535,6 +1611,13 @@ class Music(commands.Cog):
         ytdlp_info: dict[str, Any] | None = None
 
         if URL_RE.match(query):
+            host = (urlsplit(query).hostname or "").lower()
+            if host in {"spotify.com", "www.spotify.com", "open.spotify.com", "play.spotify.com"}:
+                direct = await self.try_spotify(query, direct_url=True)
+                if direct:
+                    log.info("resolved source=%s tracks=%d", direct.source, len(direct.tracks))
+                    return direct
+                return None
             direct = await self.try_source("Direct link", None, query)
             if direct:
                 log.info("resolved source=%s tracks=%d", direct.source, len(direct.tracks))
@@ -1547,7 +1630,11 @@ class Music(commands.Cog):
         for spec in SOURCE_CHAIN:
             if spec.source_name in exclude:
                 continue
-            result = await self.try_source(spec.label, spec.prefix, search_term)
+            result = (
+                await self.try_spotify(search_term)
+                if spec.source_name == "spotify"
+                else await self.try_source(spec.label, spec.prefix, search_term)
+            )
             if result:
                 log.info("resolved source=%s tracks=%d", result.source, len(result.tracks))
                 return result
@@ -1582,22 +1669,51 @@ class Music(commands.Cog):
                 seen.add(normalized)
                 unique_queries.append(candidate_query)
 
-        # YouTube OAuth tokens do not bypass host/IP bot checks. Try cleaner,
-        # progressively broader SoundCloud searches instead of replaying the same
-        # rejected YouTube track with more accounts.
-        if failed_source in {"youtube", "youtube_music"}:
-            for candidate_query in unique_queries:
+        # Try an independent provider first. OAuth tokens do not bypass host/IP
+        # bot checks, but can still recover account-specific YouTube failures.
+        fallback_sources = (
+            (("SoundCloud", "scsearch"),)
+            if failed_source in {"youtube", "youtube_music"}
+            else (("YouTube Music", "ytmsearch"), ("YouTube", "ytsearch"))
+            if failed_source == "soundcloud"
+            else (("SoundCloud", "scsearch"), ("YouTube Music", "ytmsearch"))
+        )
+        for label, prefix in fallback_sources:
+            for candidate_query in unique_queries[:2]:
                 try:
                     result = await self.try_source(
-                        "SoundCloud", "scsearch", candidate_query, timeout=FALLBACK_SOURCE_TIMEOUT
+                        label, prefix, candidate_query, timeout=FALLBACK_SOURCE_TIMEOUT
                     )
                 except Exception as exc:
-                    log.info("fallback source=SoundCloud query=%r failed=%s", candidate_query, one_line(exc))
+                    log.info("fallback source=%s query=%r failed=%s", label, candidate_query, one_line(exc))
                     continue
                 if result:
-                    log.info("fallback resolved source=SoundCloud query=%r title=%r", candidate_query, failed.title)
+                    log.info("fallback resolved source=%s query=%r title=%r", label, candidate_query, failed.title)
                     return result.tracks[0]
-                log.info("fallback source=SoundCloud query=%r returned no track", candidate_query)
+                log.info("fallback source=%s query=%r returned no track", label, candidate_query)
+
+        # Use spare YouTube accounts only after an independent provider has had
+        # a chance. They are optional; YouTube may still reject Railway's IP.
+        if failed_source in {"youtube", "youtube_music"} and YOUTUBE_OAUTH_FALLBACK_TOKENS:
+            tokens = YOUTUBE_OAUTH_FALLBACK_TOKENS
+            start = self.youtube_fallback_cursor % len(tokens)
+            for offset in range(len(tokens)):
+                index = (start + offset) % len(tokens)
+                try:
+                    async with self.youtube_auth_lock:
+                        if not await self.activate_youtube_fallback_token(tokens[index]):
+                            continue
+                        result = await self.try_source(
+                            "YouTube backup", "ytsearch", f"{artist} {title}".strip(),
+                            timeout=FALLBACK_SOURCE_TIMEOUT,
+                        )
+                except Exception as exc:
+                    log.info("YouTube backup search slot=%d failed: %s", index + 1, one_line(exc))
+                    continue
+                if result:
+                    self.youtube_fallback_cursor = (index + 1) % len(tokens)
+                    log.info("fallback resolved source=YouTube backup slot=%d title=%r", index + 1, failed.title)
+                    return result.tracks[0]
 
         # yt-dlp is useful for other direct media URLs, but it uses the same
         # YouTube egress and fails for YouTube tracks blocked by the host.
@@ -1836,11 +1952,21 @@ class Music(commands.Cog):
         player = payload.player
         if not isinstance(player, BotPlayer) or player.guild is None:
             return
-        log.warning("track stuck guild=%s title=%r; skipping", player.guild.id, payload.track.title)
+        current = player.current
+        if current is not None and current.identifier != payload.track.identifier:
+            log.info("ignored stale stuck event guild=%s title=%r", player.guild.id, payload.track.title)
+            return
+        threshold = getattr(payload, "threshold_ms", None)
+        log.warning(
+            "track stuck guild=%s title=%r threshold_ms=%s; trying fallback",
+            player.guild.id,
+            payload.track.title,
+            threshold if threshold is not None else "unknown",
+        )
         try:
-            await player.skip(force=True)
+            await self.advance(player, payload.track, "loadfailed")
         except Exception as exc:
-            log.warning("skip after stuck track failed: %s", one_line(exc))
+            log.warning("fallback after stuck track failed: %s", one_line(exc))
 
     @commands.Cog.listener()
     async def on_voice_state_update(
