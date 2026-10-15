@@ -906,7 +906,7 @@ class Music(commands.Cog):
         last_error: BaseException | None = None
         for attempt in (1, 2):
             try:
-                return await channel.connect(cls=BotPlayer, self_deaf=True, timeout=VOICE_CONNECT_TIMEOUT)
+                return await channel.connect(cls=BotPlayer, self_deaf=False, timeout=VOICE_CONNECT_TIMEOUT)
             except (wavelink.exceptions.ChannelTimeoutException, asyncio.TimeoutError) as exc:
                 last_error = exc
                 log.warning("voice connect timeout guild=%s attempt=%d", channel.guild.id, attempt)
