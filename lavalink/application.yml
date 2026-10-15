@@ -55,7 +55,7 @@ plugins:
       - WEB
       - WEBEMBEDDED
     oauth:
-      enabled: true
+      enabled: ${YOUTUBE_OAUTH_ENABLED:false}
       refreshToken: "${YOUTUBE_OAUTH_REFRESH_TOKEN:}"
       skipInitialization: false
 
