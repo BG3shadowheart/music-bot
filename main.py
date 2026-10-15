@@ -99,7 +99,9 @@ MAX_PLAYLISTS_PER_USER = 25
 MAX_PLAYLIST_TRACKS = 200
 MIN_LAVALINK = (4, 2, 2)
 URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
-EMBED_COLOR = 0x5865F2
+EMBED_COLOR = 0xF4A7C7
+VOICE_REGION = "singapore"
+PLAYBACK_BITRATE = 384_000
 
 
 # --------------------------------------------------------------------------- #
@@ -202,8 +204,10 @@ async def reply(
     *,
     embed: discord.Embed | None = None,
     ephemeral: bool = False,
+    delete_after: float | None = None,
 ) -> discord.Message | None:
-    delete_after = 20.0 if (ephemeral and ctx.interaction is None) else None
+    if delete_after is None and ephemeral and ctx.interaction is None:
+        delete_after = 20.0
     try:
         return await ctx.send(content, embed=embed, ephemeral=ephemeral, delete_after=delete_after)
     except discord.Forbidden:
@@ -331,6 +335,7 @@ class BotPlayer(wavelink.Player):
         self.play_lock = asyncio.Lock()
         self.starting_track: bool = False
         self.panel_message_id: int | None = None
+        self.idle_bitrate: int | None = None
         self.panel_lock = asyncio.Lock()
         self.last_end_signature: tuple[str, str] | None = None
         self.last_end_at: float = 0.0
@@ -396,6 +401,7 @@ def snapshot_player(player: BotPlayer, previous: dict[str, Any] | None = None) -
         "queue": queue_raw,
         "volume": player.volume_pref,
         "volume_max": 1000,
+        "idle_bitrate": player.idle_bitrate,
         "loop": player.loop_mode,
         "stay_247": player.stay_247,
         "autoplay": player.autoplay_enabled,
@@ -743,6 +749,18 @@ class Music(commands.Cog):
         task.add_done_callback(self.background.discard)
         return task
 
+    def delete_invocation_later(self, ctx: Ctx, delay: float = 8.0) -> None:
+        if ctx.interaction is None and ctx.message is not None:
+            self.spawn(self._delete_message_later(ctx.message, delay))
+
+    @staticmethod
+    async def _delete_message_later(message: discord.Message, delay: float) -> None:
+        await asyncio.sleep(delay)
+        try:
+            await message.delete()
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
+
     async def cog_load(self) -> None:
         log.info("dave: channelId voice payload patch active; required lavalink >= %d.%d.%d", *MIN_LAVALINK)
         if not await self.connect_node_once():
@@ -974,6 +992,7 @@ class Music(commands.Cog):
                 await existing.disconnect(force=True)
             except Exception as exc:
                 log.debug("clearing stale voice client failed: %s", one_line(exc))
+        await self.pin_voice_region(channel)
         try:
             player = await self.connect_player(channel)
         except (wavelink.exceptions.WavelinkException, asyncio.TimeoutError, discord.DiscordException) as exc:
@@ -993,6 +1012,11 @@ class Music(commands.Cog):
         except (TypeError, ValueError):
             raw_volume = DEFAULT_VOLUME
         player.volume_pref = max(0, min(1000, raw_volume))
+        try:
+            saved_idle_bitrate = int(data.get("idle_bitrate")) if data.get("idle_bitrate") is not None else None
+        except (TypeError, ValueError):
+            saved_idle_bitrate = None
+        player.idle_bitrate = saved_idle_bitrate
         player.text_channel_id = data.get("text_channel_id")
         try:
             player.panel_message_id = int(data.get("panel_message_id")) if data.get("panel_message_id") else None
@@ -1002,6 +1026,7 @@ class Music(commands.Cog):
             player.queue.put(track)
         player.user_paused = bool(data.get("user_paused"))
         await self.update_listener_state(player)
+        await self.apply_voice_channel_settings(player, playing=bool(current or queued))
 
         if current is not None:
             position = int(data.get("position") or 0)
@@ -1039,6 +1064,68 @@ class Music(commands.Cog):
         return True
 
     # ---- voice connection ------------------------------------------------------ #
+    async def pin_voice_region(self, channel: Any) -> None:
+        """Keep the selected voice channel on the user's requested Singapore region."""
+        if not isinstance(channel, discord.VoiceChannel):
+            return
+        if getattr(channel, "rtc_region", None) == VOICE_REGION:
+            return
+        try:
+            await channel.edit(
+                rtc_region="singapore",
+                reason="Keep the ABN Music voice channel on the requested Singapore region",
+            )
+        except discord.Forbidden:
+            log.warning("cannot set Singapore voice region channel=%s (Manage Channels permission required)", channel.id)
+        except discord.HTTPException as exc:
+            log.warning("could not set Singapore voice region channel=%s err=%s", channel.id, one_line(exc))
+
+    async def apply_voice_channel_settings(self, player: BotPlayer, *, playing: bool) -> None:
+        """Use the server's highest supported channel bitrate during playback, then restore its prior value."""
+        channel = player.channel
+        guild = player.guild
+        if guild is None or not isinstance(channel, discord.VoiceChannel):
+            return
+
+        changes: dict[str, Any] = {}
+        if getattr(channel, "rtc_region", None) != "singapore":
+            changes["rtc_region"] = VOICE_REGION
+
+        try:
+            bitrate_limit = int(getattr(guild, "bitrate_limit", 384_000))
+        except (TypeError, ValueError):
+            bitrate_limit = 384_000
+
+        target_bitrate: int | None = None
+        if playing:
+            if player.idle_bitrate is None:
+                player.idle_bitrate = int(channel.bitrate)
+            target_bitrate = min(PLAYBACK_BITRATE, bitrate_limit)
+        elif player.idle_bitrate is not None:
+            target_bitrate = min(max(8_000, player.idle_bitrate), bitrate_limit)
+
+        if target_bitrate is not None and int(channel.bitrate) != target_bitrate:
+            changes["bitrate"] = target_bitrate
+
+        succeeded = True
+        if changes:
+            try:
+                await channel.edit(
+                    **changes,
+                    reason="Set ABN Music voice quality and keep Singapore region",
+                )
+            except discord.Forbidden:
+                succeeded = False
+                log.warning("cannot adjust voice channel settings channel=%s (Manage Channels permission required)", channel.id)
+            except discord.HTTPException as exc:
+                succeeded = False
+                log.warning("voice channel settings update failed channel=%s err=%s", channel.id, one_line(exc))
+
+        if not playing and succeeded:
+            player.idle_bitrate = None
+        if changes or (not playing and succeeded):
+            await self.persist(player)
+
     async def connect_player(self, channel: discord.VoiceChannel | discord.StageChannel) -> BotPlayer:
         await self.require_node()
         last_error: BaseException | None = None
@@ -1077,7 +1164,11 @@ class Music(commands.Cog):
         if not (permissions.connect and permissions.speak):
             raise UserFacingError(f"I need **Connect** and **Speak** permissions in {channel.mention}.")
         old = player.channel
+        await self.apply_voice_channel_settings(player, playing=False)
+        await self.pin_voice_region(channel)
         await player.move_to(channel)
+        if player.current is not None or player.starting_track:
+            await self.apply_voice_channel_settings(player, playing=True)
         log.info("moved voice guild=%s from=%s to=%s", channel.guild.id, old.id if old else None, channel.id)
         await self.update_listener_state(player)
         await self.persist(player)
@@ -1096,6 +1187,8 @@ class Music(commands.Cog):
                 if not connect:
                     raise UserFacingError(f"Join {vc.channel.mention} to control me.")
                 await self.move_player(vc, user_channel)
+            if connect and vc.channel is not None:
+                await self.pin_voice_region(vc.channel)
             vc.text_channel_id = ctx.channel.id
             return vc
         if not connect:
@@ -1108,6 +1201,7 @@ class Music(commands.Cog):
         permissions = user_channel.permissions_for(ctx.guild.me)
         if not (permissions.connect and permissions.speak):
             raise UserFacingError(f"I need **Connect** and **Speak** permissions in {user_channel.mention}.")
+        await self.pin_voice_region(user_channel)
         player = await self.connect_player(user_channel)
         player.text_channel_id = ctx.channel.id
         self.bot.leaving.discard(ctx.guild.id)
@@ -1139,6 +1233,9 @@ class Music(commands.Cog):
         raise UserFacingError("The music backend is unavailable right now. Please try again shortly.")
 
     async def leave_guild(self, guild: discord.Guild) -> None:
+        vc = guild.voice_client
+        if isinstance(vc, BotPlayer):
+            await self.apply_voice_channel_settings(vc, playing=False)
         self.bot.leaving.add(guild.id)
         self.cancel_task(self.idle_tasks, guild.id)
         self.cancel_task(self.empty_tasks, guild.id)
@@ -1213,8 +1310,14 @@ class Music(commands.Cog):
         if current is not None:
             embed = self.now_playing_embed(player, current)
         else:
-            embed = discord.Embed(title="Music player", description=status or "Nothing is playing.", color=EMBED_COLOR)
-            embed.set_footer(text=f"24/7: {'on' if player.stay_247 else 'off'} • Volume {player.volume_pref}%")
+            embed = discord.Embed(
+                title="🎀 ABN Music Lounge",
+                description=status or "♡ Nothing is playing yet. Add a song whenever you're ready!",
+                color=EMBED_COLOR,
+            )
+            if self.bot.user:
+                embed.set_author(name="ABN Music • Anime Radio", icon_url=self.bot.user.display_avatar.url)
+            embed.set_footer(text=f"♡ 24/7 {'on' if player.stay_247 else 'off'}  •  🔊 {player.volume_pref}%")
         upcoming = list(player.queue)[:5]
         if upcoming:
             embed.add_field(
@@ -1472,9 +1575,7 @@ class Music(commands.Cog):
             log.warning("fallbacks exhausted already for title=%r", failed.title)
             return None
         player.fallback_queries_tried.add(signature)
-        await self.notify(
-            player, f"⚠️ **{discord.utils.escape_markdown(failed.title)}** failed to stream; trying another source…"
-        )
+        # Keep source recovery quiet in chat; diagnostics stay in Railway logs.
         # Try yt-dlp first. Its signed YouTube URL must stay behind the private relay:
         # Lavalink runs in a separate Railway service and direct GoogleVideo URLs are IP-bound.
         try:
@@ -1574,6 +1675,7 @@ class Music(commands.Cog):
         if player.autoplay_enabled and ended is not None and await self.autoplay_next(player, ended):
             return
         if not player.autoplay_enabled:
+            await self.apply_voice_channel_settings(player, playing=False)
             await self.update_panel(player, status="Queue finished. Use .play to start another song.")
         self.schedule_idle(player)
         await self.persist(player)
@@ -1658,6 +1760,7 @@ class Music(commands.Cog):
         player.starting_track = False
         self.cancel_task(self.idle_tasks, player.guild.id)
         log.info("track started guild=%s title=%r source=%s", player.guild.id, track.title, track.source)
+        await self.apply_voice_channel_settings(player, playing=True)
         await self.update_panel(player, track=track)
         player.last_started = track.identifier
         await self.persist(player)
@@ -1764,15 +1867,33 @@ class Music(commands.Cog):
 
     # ---- embeds --------------------------------------------------------------------------------- #
     def now_playing_embed(self, player: BotPlayer, track: wavelink.Playable) -> discord.Embed:
-        embed = discord.Embed(title="Now playing", description=track_line(track), color=EMBED_COLOR)
-        embed.add_field(name="Artist", value=discord.utils.escape_markdown(track.author or "Unknown"), inline=True)
-        embed.add_field(name="Length", value="LIVE" if track.is_stream else fmt_ms(track.length), inline=True)
-        embed.add_field(name="Source", value=str(track.source or "unknown"), inline=True)
+        embed = discord.Embed(
+            title="🎀 Now Playing",
+            description=f"♡ {track_line(track)}",
+            color=EMBED_COLOR,
+        )
+        if self.bot.user:
+            embed.set_author(name="ABN Music • Anime Radio", icon_url=self.bot.user.display_avatar.url)
+        else:
+            embed.set_author(name="ABN Music • Anime Radio")
+        artist = discord.utils.escape_markdown(track.author or "Unknown artist")
+        embed.add_field(name="🎤 Artist", value=artist, inline=True)
+        embed.add_field(name="⏱️ Length", value="LIVE" if track.is_stream else fmt_ms(track.length), inline=True)
+        source_key = str(track.source or "unknown").lower()
+        source_name = {
+            "youtube": "YouTube",
+            "youtube_music": "YouTube Music",
+            "soundcloud": "SoundCloud",
+            "http": "Direct audio",
+        }.get(source_key, source_key.replace("_", " ").title())
+        embed.add_field(name="🎧 Source", value=source_name, inline=True)
         if track.artwork:
             embed.set_thumbnail(url=track.artwork)
         embed.set_footer(
-            text=f"{'Paused' if player.paused else 'Playing'} • 24/7: {'on' if player.stay_247 else 'off'}"
-            f" • Volume {player.volume_pref}% • Loop: {player.loop_mode} • Filter: {player.filter_name}"
+            text=f"♡ {'Paused' if player.paused else 'Playing'}"
+            f"  •  24/7 {'on' if player.stay_247 else 'off'}"
+            f"  •  🔊 {player.volume_pref}%"
+            f"  •  Loop {player.loop_mode}"
         )
         return embed
 
@@ -1905,15 +2026,21 @@ class Music(commands.Cog):
             self.cancel_task(self.idle_tasks, ctx.guild.id)
             if resolution.playlist_name:
                 await reply(
-                    ctx, f"📃 Queued **{len(tracks)}** tracks from **{discord.utils.escape_markdown(resolution.playlist_name)}**."
-                )
-            elif was_idle:
-                await reply(ctx, f"▶️ Starting {track_line(tracks[0])} *(via {resolution.source})*")
-            else:
-                await reply(
                     ctx,
-                    f"➕ Queued {track_line(tracks[0])} at position **{player.queue.count}** *(via {resolution.source})*",
+                    f"🎀 Added **{len(tracks)}** songs from **{discord.utils.escape_markdown(resolution.playlist_name)}** to the queue.",
+                    delete_after=8,
                 )
+            else:
+                title = discord.utils.escape_markdown((tracks[0].title or "your song")[:120])
+                if was_idle:
+                    await reply(ctx, f"🎀 Starting **{title}**. Player controls are in the panel.", delete_after=8)
+                else:
+                    await reply(
+                        ctx,
+                        f"🎀 Added **{title}** to the queue • position **{player.queue.count}**.",
+                        delete_after=8,
+                    )
+            self.delete_invocation_later(ctx)
         except wavelink.exceptions.LavalinkLoadException as exc:
             log.debug("play load failure: %s", one_line(exc))
             await reply(ctx, "⚠️ That track couldn't be loaded. Try another one.", ephemeral=True)
@@ -1944,6 +2071,7 @@ class Music(commands.Cog):
             player.suppress_advance = False
             raise
         player.starting_track = False
+        await self.apply_voice_channel_settings(player, playing=False)
         self.schedule_idle(player)
         await self.persist(player)
         await self.update_panel(player, status="Stopped. Queue cleared. Use .play to start music.", force_status=True)
@@ -2323,6 +2451,7 @@ class MusicControls(discord.ui.View):
             player.suppress_advance = True
             await player.skip(force=True)
         player.starting_track = False
+        await music.apply_voice_channel_settings(player, playing=False)
         await music.persist(player)
         await music.update_panel(player, status="Stopped. Queue cleared. Use .play to start music.", force_status=True)
         await interaction.followup.send("Stopped and cleared the queue.", ephemeral=True)
