@@ -13,6 +13,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import sys
 import time
 from collections import deque
@@ -22,6 +23,7 @@ from typing import Any, Awaitable, Callable, Literal, NamedTuple, Optional, Type
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import aiohttp
+from aiohttp import web
 import discord
 import wavelink
 import yt_dlp
@@ -87,6 +89,9 @@ SEARCH_TIMEOUT = _env_float("SEARCH_TIMEOUT", 8.0)
 LAVALINK_TIMEOUT = _env_float("LAVALINK_TIMEOUT", 20.0)
 VOICE_CONNECT_TIMEOUT = _env_float("VOICE_CONNECT_TIMEOUT", 20.0)
 YTDLP_TIMEOUT = _env_float("YTDLP_TIMEOUT", 8.0)
+AUDIO_PROXY_PORT = max(1, min(65535, _env_int("AUDIO_PROXY_PORT", 8765)))
+AUDIO_PROXY_BIND = os.getenv("AUDIO_PROXY_BIND", "::")
+AUDIO_PROXY_BASE_URL = os.getenv("AUDIO_PROXY_BASE_URL", "").strip().rstrip("/")
 IDLE_TIMEOUT = _env_int("IDLE_TIMEOUT_SECONDS", 300)
 EMPTY_LEAVE_SECONDS = _env_int("EMPTY_LEAVE_SECONDS", 600)  # 0 = never leave an empty channel
 MAX_QUEUE = 500
@@ -319,12 +324,14 @@ class BotPlayer(wavelink.Player):
         self.last_started: str | None = None
         self.history_keys: deque[str] = deque(maxlen=50)
         self.fallbacks_tried: set[str] = set()
+        self.fallback_queries_tried: set[str] = set()
         self.auto_pause_reasons: set[str] = set()  # "empty" / "muted"
         self.user_paused: bool = False
         self.pause_lock = asyncio.Lock()
         self.play_lock = asyncio.Lock()
         self.starting_track: bool = False
         self.panel_message_id: int | None = None
+        self.panel_lock = asyncio.Lock()
         self.last_end_signature: tuple[str, str] | None = None
         self.last_end_at: float = 0.0
         # Queue advancement is handled by the bot (own loop/autoplay/fallback logic).
@@ -453,6 +460,15 @@ def _ytdlp_extract_sync(query: str) -> dict[str, Any] | None:
         "author": info.get("uploader") or info.get("channel") or "Unknown artist",
         "webpage": info.get("webpage_url") or target,
         "thumbnail": info.get("thumbnail"),
+        "http_headers": info.get("http_headers") or {},
+        "content_type": info.get("mime_type") or {
+            "webm": "audio/webm",
+            "m4a": "audio/mp4",
+            "mp4": "video/mp4",
+            "mp3": "audio/mpeg",
+            "opus": "audio/ogg",
+            "ogg": "audio/ogg",
+        }.get(str(info.get("ext") or "").lower(), "audio/webm"),
     }
 
 
@@ -475,11 +491,118 @@ class MusicBot(commands.Bot):
         self.store = StateStore(STATE_FILE)
         self.sibling_ids = set(SIBLING_BOT_IDS)
         self.session: aiohttp.ClientSession | None = None
+        self.audio_proxy_session: aiohttp.ClientSession | None = None
+        self.audio_proxy_runner: web.AppRunner | None = None
+        self.audio_proxy_ready = False
+        private_domain = os.getenv("RAILWAY_PRIVATE_DOMAIN", "").strip() or "127.0.0.1"
+        self.audio_proxy_base_url = AUDIO_PROXY_BASE_URL or f"http://{private_domain}:{AUDIO_PROXY_PORT}"
+        self.audio_streams: dict[str, dict[str, Any]] = {}
         self.leaving: set[int] = set()
         self.recovering = False
         self.last_recover = 0.0
         self.initial_restore_done = False
         self.tree.error(self.on_tree_error)
+
+    async def start_audio_proxy(self) -> None:
+        """Serve yt-dlp media through this service so Lavalink uses the same egress IP."""
+        self.audio_proxy_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=12, sock_read=60)
+        )
+        app = web.Application()
+        app.router.add_route("*", "/audio/{stream_id}", self.proxy_audio_stream)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        try:
+            site = web.TCPSite(runner, host=AUDIO_PROXY_BIND, port=AUDIO_PROXY_PORT)
+            await site.start()
+        except OSError as exc:
+            await runner.cleanup()
+            if self.audio_proxy_session and not self.audio_proxy_session.closed:
+                await self.audio_proxy_session.close()
+            self.audio_proxy_session = None
+            log.warning("audio proxy could not bind port=%s err=%s", AUDIO_PROXY_PORT, one_line(exc))
+            return
+        self.audio_proxy_runner = runner
+        self.audio_proxy_ready = True
+        log.info("private audio proxy ready port=%s", AUDIO_PROXY_PORT)
+
+    def register_audio_stream(self, info: dict[str, Any]) -> str | None:
+        if not self.audio_proxy_ready or not info.get("url"):
+            return None
+        now = time.monotonic()
+        for stale_key, item in list(self.audio_streams.items()):
+            if item["expires"] <= now:
+                self.audio_streams.pop(stale_key, None)
+        stream_id = secrets.token_urlsafe(24)
+        allowed_headers = {"user-agent", "accept", "accept-language", "referer", "origin", "cookie"}
+        raw_headers = info.get("http_headers") or {}
+        headers = {
+            str(name): str(value)
+            for name, value in raw_headers.items()
+            if str(name).lower() in allowed_headers and value is not None
+        }
+        content_type = str(info.get("content_type") or "audio/webm")
+        self.audio_streams[stream_id] = {
+            "url": str(info["url"]),
+            "headers": headers,
+            "content_type": content_type,
+            "expires": now + 3600,
+        }
+        return f"{self.audio_proxy_base_url}/audio/{stream_id}"
+
+    async def proxy_audio_stream(self, request: web.Request) -> web.StreamResponse:
+        if request.method not in {"GET", "HEAD"}:
+            return web.Response(status=405, text="Method not allowed.")
+        stream_id = request.match_info["stream_id"]
+        item = self.audio_streams.get(stream_id)
+        if item is None or item["expires"] <= time.monotonic():
+            self.audio_streams.pop(stream_id, None)
+            return web.Response(status=410, text="This audio link has expired.")
+        session = self.audio_proxy_session
+        if session is None or session.closed:
+            return web.Response(status=503, text="Audio relay is unavailable.")
+        headers = dict(item["headers"])
+        if request.headers.get("Range"):
+            headers["Range"] = request.headers["Range"]
+        upstream: aiohttp.ClientResponse | None = None
+        response: web.StreamResponse | None = None
+        try:
+            upstream = await session.request(
+                request.method, item["url"], headers=headers, allow_redirects=True
+            )
+            if upstream.status not in (200, 206):
+                status = upstream.status if 400 <= upstream.status <= 599 else 502
+                return web.Response(status=status, text="The upstream audio stream is unavailable.")
+            upstream_type = upstream.headers.get("Content-Type", "")
+            content_type = (
+                upstream_type
+                if upstream_type.lower().startswith(("audio/", "video/"))
+                else item["content_type"]
+            )
+            response_headers = {"Content-Type": content_type, "Accept-Ranges": "bytes"}
+            for name in ("Content-Length", "Content-Range", "Last-Modified", "ETag"):
+                value = upstream.headers.get(name)
+                if value:
+                    response_headers[name] = value
+            response = web.StreamResponse(status=upstream.status, headers=response_headers)
+            await response.prepare(request)
+            if request.method != "HEAD":
+                async for chunk in upstream.content.iter_chunked(64 * 1024):
+                    await response.write(chunk)
+            await response.write_eof()
+            return response
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            log.warning("private audio relay request failed err=%s", one_line(exc))
+            if response is not None:
+                return response
+            return web.Response(status=502, text="The upstream audio stream is unavailable.")
+        except (ConnectionResetError, BrokenPipeError):
+            if response is not None:
+                return response
+            return web.Response(status=499, text="The audio client disconnected.")
+        finally:
+            if upstream is not None:
+                upstream.release()
 
     async def setup_hook(self) -> None:
         self.store.load()
@@ -487,6 +610,7 @@ class MusicBot(commands.Bot):
             timeout=aiohttp.ClientTimeout(total=10),
             headers={"User-Agent": "SelfHostedMusicBot/1.0"},
         )
+        await self.start_audio_proxy()
         await self.add_cog(Music(self))
         allowed = {"help", "join", "play", "stop"}
         for name in list(self.all_commands):
@@ -515,6 +639,11 @@ class MusicBot(commands.Bot):
             await wavelink.Pool.close()
         except Exception as exc:
             log.debug("pool close failed: %s", one_line(exc))
+        if self.audio_proxy_runner is not None:
+            await self.audio_proxy_runner.cleanup()
+            self.audio_proxy_runner = None
+        if self.audio_proxy_session and not self.audio_proxy_session.closed:
+            await self.audio_proxy_session.close()
         if self.session and not self.session.closed:
             await self.session.close()
         await super().close()
@@ -1031,6 +1160,21 @@ class Music(commands.Cog):
         track: wavelink.Playable | None = None,
         status: str | None = None,
         force_status: bool = False,
+        refresh: bool = False,
+    ) -> None:
+        async with player.panel_lock:
+            await self._render_panel(
+                player, track=track, status=status, force_status=force_status, refresh=refresh
+            )
+
+    async def _render_panel(
+        self,
+        player: BotPlayer,
+        *,
+        track: wavelink.Playable | None = None,
+        status: str | None = None,
+        force_status: bool = False,
+        refresh: bool = False,
     ) -> None:
         if player.guild is None:
             log.warning("music panel unavailable: player has no guild")
@@ -1054,6 +1198,17 @@ class Music(commands.Cog):
         if not isinstance(channel, discord.abc.Messageable):
             log.warning("music panel unavailable channel=%s: channel is not messageable", player.text_channel_id)
             return
+        if refresh and player.panel_message_id is not None:
+            try:
+                previous = await channel.fetch_message(player.panel_message_id)
+                await previous.edit(
+                    content="🎵 The active player controls are in the latest player panel below.",
+                    embed=None,
+                    view=None,
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+            player.panel_message_id = None
         current = track if track is not None else (None if force_status else player.current)
         if current is not None:
             embed = self.now_playing_embed(player, current)
@@ -1242,7 +1397,11 @@ class Music(commands.Cog):
 
     async def ytdlp_to_resolution(self, info: dict[str, Any]) -> Resolution | None:
         try:
-            found = await self.lavalink_search(info["url"], None)
+            proxy_url = self.bot.register_audio_stream(info)
+            if proxy_url is None:
+                log.warning("source=yt-dlp audio relay is unavailable")
+                return None
+            found = await self.lavalink_search(proxy_url, None)
         except UserFacingError:
             raise
         except Exception as exc:
@@ -1307,15 +1466,35 @@ class Music(commands.Cog):
         if key in player.fallbacks_tried:
             return None
         player.fallbacks_tried.add(key)
+        query = f"{failed.title} {failed.author}".strip()
+        signature = re.sub(r"[^a-z0-9]+", " ", query.casefold()).strip() or key.casefold()
+        if signature in player.fallback_queries_tried:
+            log.warning("fallbacks exhausted already for title=%r", failed.title)
+            return None
+        player.fallback_queries_tried.add(signature)
         await self.notify(
             player, f"⚠️ **{discord.utils.escape_markdown(failed.title)}** failed to stream; trying another source…"
         )
+        # Try yt-dlp first. Its signed YouTube URL must stay behind the private relay:
+        # Lavalink runs in a separate Railway service and direct GoogleVideo URLs are IP-bound.
         try:
-            result = await self.resolve(f"{failed.title} {failed.author}", exclude=frozenset({failed.source or ""}))
+            ytdlp_info = await self.ytdlp_extract(query)
+            if ytdlp_info is not None:
+                result = await self.ytdlp_to_resolution(ytdlp_info)
+                if result:
+                    log.info("fallback resolved source=yt-dlp title=%r", failed.title)
+                    return result.tracks[0]
         except Exception as exc:
-            log.debug("fallback resolve failed: %s", one_line(exc))
-            return None
-        return result.tracks[0] if result else None
+            log.debug("yt-dlp fallback failed: %s", one_line(exc))
+        try:
+            result = await self.try_source("SoundCloud", "scsearch", query)
+            if result:
+                log.info("fallback resolved source=SoundCloud title=%r", failed.title)
+                return result.tracks[0]
+        except Exception as exc:
+            log.debug("SoundCloud fallback failed: %s", one_line(exc))
+        log.warning("no fallback source resolved title=%r", failed.title)
+        return None
 
     # ---- playback core ---------------------------------------------------------------------- #
     async def play_next(self, player: BotPlayer) -> bool:
@@ -1678,7 +1857,7 @@ class Music(commands.Cog):
         self.cancel_task(self.idle_tasks, ctx.guild.id)
         self.cancel_task(self.empty_tasks, ctx.guild.id)
         await self.persist(player)
-        await self.update_panel(player, status="Connected and staying in voice. Use .play to start music.")
+        await self.update_panel(player, status="Connected and staying in voice. Use .play to start music.", refresh=True)
         await reply(ctx, f"🔊 Joined {channel.mention} and enabled 24/7 mode.")
 
     @commands.hybrid_command(name="leave", aliases=["disconnect", "dc"], description="Leave the voice channel")
@@ -1704,6 +1883,7 @@ class Music(commands.Cog):
             player = await self.ensure_player(ctx, connect=True)
             # Playing music should also opt this guild into persistent 24/7 voice mode.
             player.stay_247 = True
+            player.fallback_queries_tried.clear()
             self.cancel_task(self.idle_tasks, ctx.guild.id)
             self.cancel_task(self.empty_tasks, ctx.guild.id)
             room = MAX_QUEUE - player.queue.count
@@ -1720,6 +1900,7 @@ class Music(commands.Cog):
             await self.update_panel(
                 player,
                 status="Connected. Waiting for playback." if player.current is None else None,
+                refresh=True,
             )
             self.cancel_task(self.idle_tasks, ctx.guild.id)
             if resolution.playlist_name:
@@ -1754,6 +1935,7 @@ class Music(commands.Cog):
         player.queue.clear()
         player.loop_mode = "off"
         player.fallbacks_tried.clear()
+        player.fallback_queries_tried.clear()
         if player.current is not None:
             player.suppress_advance = True
         try:
@@ -2136,6 +2318,7 @@ class MusicControls(discord.ui.View):
         player.queue.clear()
         player.loop_mode = "off"
         player.fallbacks_tried.clear()
+        player.fallback_queries_tried.clear()
         if player.current is not None:
             player.suppress_advance = True
             await player.skip(force=True)
