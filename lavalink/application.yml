@@ -6,8 +6,8 @@ server:
 
 lavalink:
   plugins:
-    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.2"
-      snapshot: false
+    - dependency: "dev.lavalink.youtube:youtube-plugin:2be8e542d3f6f178e048dca565892684c2e40177"
+      snapshot: true
     - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.8.3"
       repository: "https://maven.lavalink.dev/releases"
       snapshot: false
@@ -64,12 +64,14 @@ plugins:
       url: "https://cipher.kikkia.dev/"
       userAgent: "ABN-Miyazono"
     clients:
+      - MWEB
+      - IOS
+      - WEB
+      - WEBEMBEDDED
+      - ANDROID_VR
       - MUSIC
       - TV
       - TVHTML5_SIMPLY
-      - ANDROID_VR
-      - WEBEMBEDDED
-      - WEB
     oauth:
       enabled: ${YOUTUBE_OAUTH_ENABLED:false}
       refreshToken: "${YOUTUBE_OAUTH_REFRESH_TOKEN:}"
