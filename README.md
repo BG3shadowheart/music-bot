@@ -67,9 +67,14 @@ If Lavalink crashes with `Invalid status code for oauth2 token fetch: 400`, clea
    | `RAILWAY_RUN_UID` | yes | `0` (lets the bot write to the mounted volume) |
    | `STATE_FILE` | no | Default `/data/state.json` |
    | `BOT_PREFIX` | no | Default `.` |
-   | `DEFAULT_VOLUME` | no | Default `60` |
+   | `DEFAULT_VOLUME` | no | Default `120` |
    | `IDLE_TIMEOUT_SECONDS` | no | Default `300` |
    | `SYNC_SLASH_COMMANDS` | no | Default `true` (slash commands mirror the prefix commands) |
+   | `LAVASRC_SPOTIFY_CLIENT_ID` | no | On `bot`, use Railway reference `${{lavalink.LAVASRC_SPOTIFY_CLIENT_ID}}` |
+   | `LAVASRC_SPOTIFY_CLIENT_SECRET` | no | On `bot`, use Railway reference `${{lavalink.LAVASRC_SPOTIFY_CLIENT_SECRET}}` |
+   | `LAVASRC_SPOTIFY_CLIENT_ID_FALLBACK` | no | Backup Spotify app client ID on `bot` |
+   | `LAVASRC_SPOTIFY_CLIENT_SECRET_FALLBACK` | no | Backup Spotify app client secret on `bot`; keep private |
+   | `YOUTUBE_OAUTH_FALLBACK_TOKENS` | no | Up to two comma-separated backup YouTube refresh tokens on `bot` |
    | `YTDLP_COOKIES_FILE` | no | Path to a cookies file for yt-dlp fallback |
    | `LOG_LEVEL` | no | `INFO` (use `DEBUG` to see per-source failures) |
    | `EMPTY_LEAVE_SECONDS` | no | Default `600`. Leave after nobody has listened this long (`0` = never). Music is paused immediately when no humans are present. |
@@ -81,7 +86,7 @@ If Lavalink crashes with `Invalid status code for oauth2 token fetch: 400`, clea
 
 ## 5. Commands
 
-`.join` `.leave` `.play <query|url>` `.stop` `.skip` `.pause` `.resume` `.queue` `.nowplaying` `.volume <0-100>` `.loop <track|queue|off>` `.shuffle` `.seek <seconds>` `.lyrics` `.filter <off|bassboost|nightcore|vaporwave|8d|karaoke|tremolo|vibrato|soft|treble>` `.playlist save|load|list|delete <name>` `.247 <on|off>` `.autoplay <on|off>` `.help`
+`.help` `.join` `.play <query|url>` `.stop`. The player controls are shown in the music panel.
 
 ## Listener-aware playback
 
