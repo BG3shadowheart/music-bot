@@ -83,18 +83,13 @@ BOT_PREFIX = os.getenv("BOT_PREFIX", ".")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 SYNC_SLASH = os.getenv("SYNC_SLASH_COMMANDS", "true").lower() in ("1", "true", "yes", "on")
 YTDLP_COOKIES = os.getenv("YTDLP_COOKIES_FILE", "")
-YOUTUBE_OAUTH_FALLBACK_TOKENS = tuple(
-    token.strip()
-    for token in os.getenv("YOUTUBE_OAUTH_FALLBACK_TOKENS", "").replace("\n", ",").split(",")
-    if token.strip()
-)[:2]
 
 DEFAULT_VOLUME = max(0, min(1000, _env_int("DEFAULT_VOLUME", 120)))
 SEARCH_TIMEOUT = _env_float("SEARCH_TIMEOUT", 8.0)
 LAVALINK_TIMEOUT = _env_float("LAVALINK_TIMEOUT", 20.0)
 VOICE_CONNECT_TIMEOUT = _env_float("VOICE_CONNECT_TIMEOUT", 20.0)
 YTDLP_TIMEOUT = _env_float("YTDLP_TIMEOUT", 8.0)
-FALLBACK_SOURCE_TIMEOUT = _env_float("FALLBACK_SOURCE_TIMEOUT", 5.0)
+FALLBACK_SOURCE_TIMEOUT = _env_float("FALLBACK_SOURCE_TIMEOUT", 3.0)
 AUDIO_PROXY_PORT = max(1, min(65535, _env_int("AUDIO_PROXY_PORT", 8765)))
 AUDIO_PROXY_BIND = os.getenv("AUDIO_PROXY_BIND", "::")
 AUDIO_PROXY_BASE_URL = os.getenv("AUDIO_PROXY_BASE_URL", "").strip().rstrip("/")
@@ -335,7 +330,6 @@ class BotPlayer(wavelink.Player):
         self.last_started: str | None = None
         self.history_keys: deque[str] = deque(maxlen=50)
         self.fallbacks_tried: set[str] = set()
-        self.fallback_queries_tried: set[str] = set()
         self.auto_pause_reasons: set[str] = set()  # "empty" / "muted"
         self.user_paused: bool = False
         self.pause_lock = asyncio.Lock()
@@ -746,8 +740,6 @@ class Music(commands.Cog):
         self.empty_tasks: dict[int, asyncio.Task[None]] = {}
         self.node_task: asyncio.Task[None] | None = None
         self.background: set[asyncio.Task[Any]] = set()
-        self.youtube_auth_lock = asyncio.Lock()
-        self.youtube_fallback_cursor = 0
 
     # ---- lifecycle ---------------------------------------------------------- #
     def spawn(self, coro: Awaitable[Any]) -> asyncio.Task[Any]:
@@ -903,13 +895,21 @@ class Music(commands.Cog):
                 except Exception as exc:
                     log.debug("disconnect during recovery failed: %s", one_line(exc))
             if rebuild_node:
-                try:
-                    await wavelink.Pool.close()
-                except Exception as exc:
-                    log.debug("pool close during recovery failed: %s", one_line(exc))
-                if not await self.connect_node_once():
-                    if self.node_task is None or self.node_task.done():
-                        self.node_task = self.spawn(self.node_connect_loop())
+                # Pool.close() leaves closed nodes registered. Connecting a new
+                # Node with the same identifier then fails and strands playback.
+                existing_nodes = list(wavelink.Pool.nodes.values())
+                for node in existing_nodes:
+                    try:
+                        await node.close(eject=True)
+                    except Exception as exc:
+                        log.debug("node close during recovery failed: %s", one_line(exc))
+                if existing_nodes:
+                    connected = await wavelink.Pool.connect(nodes=existing_nodes, client=bot)
+                    node_ready = any(node.status.name == "CONNECTED" for node in connected.values())
+                else:
+                    node_ready = await self.connect_node_once()
+                if not node_ready and (self.node_task is None or self.node_task.done()):
+                    self.node_task = self.spawn(self.node_connect_loop())
             try:
                 await self.require_node(wait=30.0)
             except UserFacingError:
@@ -1563,98 +1563,57 @@ class Music(commands.Cog):
         log.info("no source could resolve the request")
         return None
 
-    async def activate_youtube_fallback_token(self, token: str) -> bool:
-        """Select one backup YouTube account on Lavalink without logging its secret token."""
-        session = self.bot.session
-        if session is None or session.closed:
-            log.warning("YouTube backup account could not be selected: Lavalink session is unavailable")
-            return False
-        try:
-            async with session.post(
-                f"{LAVALINK_URI}/youtube",
-                headers={"Authorization": LAVALINK_PASSWORD},
-                json={"refreshToken": token, "skipInitialization": True},
-                timeout=aiohttp.ClientTimeout(total=min(LAVALINK_TIMEOUT, FALLBACK_SOURCE_TIMEOUT)),
-            ) as response:
-                if response.status == 204:
-                    return True
-                log.warning("YouTube backup account was rejected by Lavalink status=%s", response.status)
-        except Exception as exc:
-            log.warning("YouTube backup account switch failed: %s", one_line(exc))
-        return False
-
     async def fallback_track(
         self, player: BotPlayer, failed: wavelink.Playable
-    ) -> tuple[wavelink.Playable | None, str | None]:
+    ) -> wavelink.Playable | None:
         key = failed.identifier or failed.title
         if key in player.fallbacks_tried:
-            return None, None
+            return None
         player.fallbacks_tried.add(key)
-        query = f"{failed.title} {failed.author}".strip()
-        signature = re.sub(r"[^a-z0-9]+", " ", query.casefold()).strip() or key.casefold()
+        failed_source = str(failed.source or "").casefold()
+        artist, title = self.split_artist_title(failed.title, failed.author)
+        queries = [f"{artist} {title}", title, f"{failed.title} {failed.author}".strip()]
+        unique_queries: list[str] = []
+        seen: set[str] = set()
+        for candidate_query in queries:
+            normalized = re.sub(r"[^a-z0-9]+", " ", candidate_query.casefold()).strip()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                unique_queries.append(candidate_query)
 
-        def mark_attempt(provider: str) -> bool:
-            marker = f"{signature}::{provider}"
-            if marker in player.fallback_queries_tried:
-                return False
-            # Record attempts per provider, not per song: if one fallback track also
-            # fails to stream, the next provider must still get a chance.
-            player.fallback_queries_tried.add(marker)
-            return True
-
-        # YouTube's hosted IP bot checks often reject every Lavalink client even
-        # when OAuth refresh succeeds. Move to a different provider first.
-        if mark_attempt("soundcloud"):
-            try:
-                result = await self.try_source(
-                    "SoundCloud", "scsearch", query, timeout=FALLBACK_SOURCE_TIMEOUT
-                )
-                if result:
-                    log.info("fallback resolved source=SoundCloud title=%r", failed.title)
-                    return result.tracks[0], None
-            except Exception as exc:
-                log.debug("SoundCloud fallback failed: %s", one_line(exc))
-
-        if mark_attempt("yt-dlp"):
-            try:
-                ytdlp_info = await self.ytdlp_extract(query, timeout=FALLBACK_SOURCE_TIMEOUT)
-                if ytdlp_info is not None:
-                    result = await self.ytdlp_to_resolution(
-                        ytdlp_info, timeout=FALLBACK_SOURCE_TIMEOUT
+        # YouTube OAuth tokens do not bypass host/IP bot checks. Try cleaner,
+        # progressively broader SoundCloud searches instead of replaying the same
+        # rejected YouTube track with more accounts.
+        if failed_source in {"youtube", "youtube_music"}:
+            for candidate_query in unique_queries:
+                try:
+                    result = await self.try_source(
+                        "SoundCloud", "scsearch", candidate_query, timeout=FALLBACK_SOURCE_TIMEOUT
                     )
+                except Exception as exc:
+                    log.info("fallback source=SoundCloud query=%r failed=%s", candidate_query, one_line(exc))
+                    continue
+                if result:
+                    log.info("fallback resolved source=SoundCloud query=%r title=%r", candidate_query, failed.title)
+                    return result.tracks[0]
+                log.info("fallback source=SoundCloud query=%r returned no track", candidate_query)
+
+        # yt-dlp is useful for other direct media URLs, but it uses the same
+        # YouTube egress and fails for YouTube tracks blocked by the host.
+        failed_uri = str(getattr(failed, "uri", "") or "")
+        if failed_source not in {"youtube", "youtube_music", "soundcloud"} and URL_RE.match(failed_uri) and not re.search(r"(?:youtube\.com|youtu\.be|youtube-nocookie\.com)", failed_uri, re.I):
+            try:
+                ytdlp_info = await self.ytdlp_extract(failed_uri, timeout=FALLBACK_SOURCE_TIMEOUT)
+                if ytdlp_info is not None:
+                    result = await self.ytdlp_to_resolution(ytdlp_info, timeout=FALLBACK_SOURCE_TIMEOUT)
                     if result:
                         log.info("fallback resolved source=yt-dlp title=%r", failed.title)
-                        return result.tracks[0], None
+                        return result.tracks[0]
             except Exception as exc:
-                log.debug("yt-dlp fallback failed: %s", one_line(exc))
-
-        # Keep the additional OAuth accounts as last-resort YouTube retries. Each
-        # account is tried at most once for this song, so failures advance cleanly.
-        tokens = YOUTUBE_OAUTH_FALLBACK_TOKENS
-        if tokens:
-            start = self.youtube_fallback_cursor % len(tokens)
-            for offset in range(len(tokens)):
-                index = (start + offset) % len(tokens)
-                if not mark_attempt(f"youtube-backup-{index + 1}"):
-                    continue
-                token = tokens[index]
-                try:
-                    async with self.youtube_auth_lock:
-                        if not await self.activate_youtube_fallback_token(token):
-                            continue
-                        result = await self.try_source(
-                            "YouTube backup", "ytsearch", query, timeout=FALLBACK_SOURCE_TIMEOUT
-                        )
-                except Exception as exc:
-                    log.debug("YouTube backup search failed: %s", one_line(exc))
-                    continue
-                if result:
-                    self.youtube_fallback_cursor = (index + 1) % len(tokens)
-                    log.info("fallback resolved source=YouTube backup account=%d title=%r", index + 1, failed.title)
-                    return result.tracks[0], token
+                log.info("fallback source=yt-dlp failed: %s", one_line(exc))
 
         log.warning("fallback providers exhausted title=%r", failed.title)
-        return None, None
+        return None
 
     # ---- playback core ---------------------------------------------------------------------- #
     async def play_next(self, player: BotPlayer) -> bool:
@@ -1691,20 +1650,17 @@ class Music(commands.Cog):
         player.remember(ended)
 
         candidate: wavelink.Playable | None = None
-        candidate_token: str | None = None
         if ended is not None and reason == "finished" and player.loop_mode == "track":
             candidate = ended
         else:
             if ended is not None and player.loop_mode == "queue" and reason in ("finished", "stopped"):
                 player.queue.put(ended)
             if ended is not None and reason == "loadfailed":
-                candidate, candidate_token = await self.fallback_track(player, ended)
+                candidate = await self.fallback_track(player, ended)
 
         for _ in range(6):
             track = candidate
-            fallback_token = candidate_token if candidate is not None else None
             candidate = None
-            candidate_token = None
             if track is None:
                 if player.queue.is_empty:
                     break
@@ -1721,17 +1677,8 @@ class Music(commands.Cog):
                     player.starting_track = True
                     player.user_paused = False
                     try:
-                        if fallback_token:
-                            async with self.youtube_auth_lock:
-                                if not await self.activate_youtube_fallback_token(fallback_token):
-                                    player.starting_track = False
-                                    log.warning("YouTube backup track could not start because its token was rejected")
-                                    continue
-                                await self.update_panel(player, track=track, refresh=True)
-                                await player.play(track, volume=player.volume_pref, paused=bool(player.auto_pause_reasons))
-                        else:
-                            await self.update_panel(player, track=track, refresh=True)
-                            await player.play(track, volume=player.volume_pref, paused=bool(player.auto_pause_reasons))
+                        await self.update_panel(player, track=track, refresh=True)
+                        await player.play(track, volume=player.volume_pref, paused=bool(player.auto_pause_reasons))
                     except BaseException:
                         player.starting_track = False
                         raise
@@ -1829,7 +1776,6 @@ class Music(commands.Cog):
         if not isinstance(player, BotPlayer) or player.guild is None:
             return
         track = payload.track
-        player.fallbacks_tried.discard(track.identifier or track.title)
         player.starting_track = False
         self.cancel_task(self.idle_tasks, player.guild.id)
         log.info("track started guild=%s title=%r source=%s", player.guild.id, track.title, track.source)
@@ -2081,7 +2027,6 @@ class Music(commands.Cog):
             player = await self.ensure_player(ctx, connect=True)
             # Playing music should also opt this guild into persistent 24/7 voice mode.
             player.stay_247 = True
-            player.fallback_queries_tried.clear()
             self.cancel_task(self.idle_tasks, ctx.guild.id)
             self.cancel_task(self.empty_tasks, ctx.guild.id)
             room = MAX_QUEUE - player.queue.count
@@ -2090,6 +2035,7 @@ class Music(commands.Cog):
             tracks = resolution.tracks[:room]
             was_idle = player.current is None
             for track in tracks:
+                player.fallbacks_tried.discard(track.identifier or track.title)
                 player.queue.put(track)
             if was_idle:
                 await self.guarded(ctx, self.play_next, what="play")
@@ -2139,7 +2085,6 @@ class Music(commands.Cog):
         player.queue.clear()
         player.loop_mode = "off"
         player.fallbacks_tried.clear()
-        player.fallback_queries_tried.clear()
         if player.current is not None:
             player.suppress_advance = True
         try:
@@ -2523,7 +2468,6 @@ class MusicControls(discord.ui.View):
         player.queue.clear()
         player.loop_mode = "off"
         player.fallbacks_tried.clear()
-        player.fallback_queries_tried.clear()
         if player.current is not None:
             player.suppress_advance = True
             await player.skip(force=True)
@@ -2549,3 +2493,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
