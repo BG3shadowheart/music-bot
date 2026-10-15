@@ -101,6 +101,7 @@ MIN_LAVALINK = (4, 2, 2)
 URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 EMBED_COLOR = 0xF4A7C7
 VOICE_REGION = "singapore"
+IDLE_BITRATE = 64_000
 PLAYBACK_BITRATE = 384_000
 
 
@@ -335,7 +336,6 @@ class BotPlayer(wavelink.Player):
         self.play_lock = asyncio.Lock()
         self.starting_track: bool = False
         self.panel_message_id: int | None = None
-        self.idle_bitrate: int | None = None
         self.panel_lock = asyncio.Lock()
         self.last_end_signature: tuple[str, str] | None = None
         self.last_end_at: float = 0.0
@@ -401,7 +401,6 @@ def snapshot_player(player: BotPlayer, previous: dict[str, Any] | None = None) -
         "queue": queue_raw,
         "volume": player.volume_pref,
         "volume_max": 1000,
-        "idle_bitrate": player.idle_bitrate,
         "loop": player.loop_mode,
         "stay_247": player.stay_247,
         "autoplay": player.autoplay_enabled,
@@ -1012,11 +1011,6 @@ class Music(commands.Cog):
         except (TypeError, ValueError):
             raw_volume = DEFAULT_VOLUME
         player.volume_pref = max(0, min(1000, raw_volume))
-        try:
-            saved_idle_bitrate = int(data.get("idle_bitrate")) if data.get("idle_bitrate") is not None else None
-        except (TypeError, ValueError):
-            saved_idle_bitrate = None
-        player.idle_bitrate = saved_idle_bitrate
         player.text_channel_id = data.get("text_channel_id")
         try:
             player.panel_message_id = int(data.get("panel_message_id")) if data.get("panel_message_id") else None
@@ -1081,33 +1075,25 @@ class Music(commands.Cog):
             log.warning("could not set Singapore voice region channel=%s err=%s", channel.id, one_line(exc))
 
     async def apply_voice_channel_settings(self, player: BotPlayer, *, playing: bool) -> None:
-        """Use the server's highest supported channel bitrate during playback, then restore its prior value."""
+        """Set Singapore region and use 384 kbps while playing, 64 kbps while idle."""
         channel = player.channel
         guild = player.guild
         if guild is None or not isinstance(channel, discord.VoiceChannel):
             return
 
         changes: dict[str, Any] = {}
-        if getattr(channel, "rtc_region", None) != "singapore":
+        if getattr(channel, "rtc_region", None) != VOICE_REGION:
             changes["rtc_region"] = VOICE_REGION
 
         try:
             bitrate_limit = int(getattr(guild, "bitrate_limit", 384_000))
         except (TypeError, ValueError):
             bitrate_limit = 384_000
-
-        target_bitrate: int | None = None
-        if playing:
-            if player.idle_bitrate is None:
-                player.idle_bitrate = int(channel.bitrate)
-            target_bitrate = min(PLAYBACK_BITRATE, bitrate_limit)
-        elif player.idle_bitrate is not None:
-            target_bitrate = min(max(8_000, player.idle_bitrate), bitrate_limit)
-
-        if target_bitrate is not None and int(channel.bitrate) != target_bitrate:
+        requested_bitrate = PLAYBACK_BITRATE if playing else IDLE_BITRATE
+        target_bitrate = min(requested_bitrate, bitrate_limit)
+        if int(channel.bitrate) != target_bitrate:
             changes["bitrate"] = target_bitrate
 
-        succeeded = True
         if changes:
             try:
                 await channel.edit(
@@ -1115,16 +1101,11 @@ class Music(commands.Cog):
                     reason="Set ABN Music voice quality and keep Singapore region",
                 )
             except discord.Forbidden:
-                succeeded = False
                 log.warning("cannot adjust voice channel settings channel=%s (Manage Channels permission required)", channel.id)
             except discord.HTTPException as exc:
-                succeeded = False
                 log.warning("voice channel settings update failed channel=%s err=%s", channel.id, one_line(exc))
-
-        if not playing and succeeded:
-            player.idle_bitrate = None
-        if changes or (not playing and succeeded):
-            await self.persist(player)
+            else:
+                await self.persist(player)
 
     async def connect_player(self, channel: discord.VoiceChannel | discord.StageChannel) -> BotPlayer:
         await self.require_node()
@@ -1977,6 +1958,10 @@ class Music(commands.Cog):
         player.stay_247 = True
         self.cancel_task(self.idle_tasks, ctx.guild.id)
         self.cancel_task(self.empty_tasks, ctx.guild.id)
+        await self.apply_voice_channel_settings(
+            player,
+            playing=bool(player.current or player.starting_track),
+        )
         await self.persist(player)
         await self.update_panel(player, status="Connected and staying in voice. Use .play to start music.", refresh=True)
         await reply(ctx, f"🔊 Joined {channel.mention} and enabled 24/7 mode.")
