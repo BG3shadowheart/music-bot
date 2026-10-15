@@ -8,6 +8,9 @@ lavalink:
   plugins:
     - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.2"
       snapshot: false
+    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.8.3"
+      repository: "https://maven.lavalink.dev/releases"
+      snapshot: false
   server:
     password: "${LAVALINK_SERVER_PASSWORD}"
     sources:
@@ -42,6 +45,16 @@ lavalink:
     gc-warnings: true
 
 plugins:
+  lavasrc:
+    providers:
+      - 'ytsearch:"%ISRC%"'
+      - "ytsearch:%QUERY%"
+    sources:
+      spotify: true
+    spotify:
+      clientId: "${LAVASRC_SPOTIFY_CLIENT_ID:}"
+      clientSecret: "${LAVASRC_SPOTIFY_CLIENT_SECRET:}"
+      countryCode: "US"
   youtube:
     enabled: true
     allowSearch: true

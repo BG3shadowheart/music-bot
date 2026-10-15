@@ -1,6 +1,6 @@
 # Self-hosted Discord Music Bot (Railway)
 
-Multi-source music bot: **YouTube Music (OAuth) → SoundCloud → YouTube → yt-dlp**, with automatic fallback, 24/7 mode, autoplay, filters, playlists, lyrics and state persistence. Built on discord.py 2.7+ (DAVE), wavelink 3.5+ and Lavalink v4.2.2+.
+Multi-source music bot: **YouTube Music → Spotify search/links → YouTube → SoundCloud → yt-dlp**, with automatic fallback, 24/7 mode, autoplay, filters, playlists, lyrics and state persistence. Spotify tracks are resolved to playable audio through LavaSrc providers; Spotify itself does not provide the audio stream. Built on discord.py 2.7+ (DAVE), wavelink 3.5+ and Lavalink v4.2.2+.
 
 ## Repository layout
 
@@ -11,7 +11,7 @@ Dockerfile              # bot service
 README.md
 lavalink/
   Dockerfile            # Lavalink service (v4.2.2 + yt-dlp)
-  application.yml       # OAuth, source config, DAVE logging
+  application.yml       # YouTube OAuth, Spotify source, DAVE logging
 ```
 
 ## 1. Create the Discord application
@@ -33,7 +33,10 @@ lavalink/
    | `LAVALINK_BIND` | `::` (only if your environment uses IPv6-only private networking; otherwise omit) |
    | `YOUTUBE_OAUTH_ENABLED` | `false` by default; set `true` only after deciding to enable YouTube OAuth |
    | `YOUTUBE_OAUTH_REFRESH_TOKEN` | Leave empty unless you have a valid refresh token |
+   | `LAVASRC_SPOTIFY_CLIENT_ID` | Spotify Developer app client ID |
+   | `LAVASRC_SPOTIFY_CLIENT_SECRET` | Spotify Developer app client secret; keep private and never commit it |
 
+   Spotify track, album, and playlist links plus `.play` searches are handled by LavaSrc. The Spotify redirect URI is not used by this server-to-server client-credentials setup; it is needed for user-authorization flows. LavaSrc mirrors Spotify track metadata to its configured audio providers (YouTube search by ISRC/title by default), because Spotify does not expose its audio stream to this bot.
 4. Do **not** generate a public domain; the bot connects over Railway's private network.
 5. Deploy and open the service logs.
 

@@ -2,7 +2,7 @@
 
 Stack: discord.py 2.7+ (voice extra, DAVE capable) + wavelink 3.5+ + Lavalink v4.2.2+.
 Source chain for every play request:
-    1. YouTube Music (ytmsearch)  2. SoundCloud (scsearch)  3. YouTube (ytsearch)  4. yt-dlp
+    1. YouTube Music (ytmsearch)  2. Spotify (spsearch)  3. YouTube (ytsearch)  4. SoundCloud (scsearch)  5. yt-dlp
 """
 from __future__ import annotations
 
@@ -420,6 +420,7 @@ class SourceSpec(NamedTuple):
 
 SOURCE_CHAIN: tuple[SourceSpec, ...] = (
     SourceSpec("YouTube Music", "ytmsearch", "youtube"),
+    SourceSpec("Spotify", "spsearch", "spotify"),
     SourceSpec("YouTube", "ytsearch", "youtube"),
     SourceSpec("SoundCloud", "scsearch", "soundcloud"),
 )
@@ -1902,6 +1903,7 @@ class Music(commands.Cog):
         source_name = {
             "youtube": "YouTube",
             "youtube_music": "YouTube Music",
+            "spotify": "Spotify",
             "soundcloud": "SoundCloud",
             "http": "Direct audio",
         }.get(source_key, source_key.replace("_", " ").title())
