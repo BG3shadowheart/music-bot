@@ -51,7 +51,7 @@ lavalink/
    | Variable | Required | Description |
    |---|---|---|
    | `DISCORD_TOKEN` | yes | Bot token |
-   | `LAVALINK_URI` | yes | `http://lavalink.railway.internal:2333` |
+   | `LAVALINK_URI` | yes | `http://${{lavalink.RAILWAY_PRIVATE_DOMAIN}}:${{lavalink.PORT}}` |
    | `LAVALINK_PASSWORD` | yes | Same value as `LAVALINK_SERVER_PASSWORD` |
    | `RAILWAY_RUN_UID` | yes | `0` (lets the bot write to the mounted volume) |
    | `STATE_FILE` | no | Default `/data/state.json` |
@@ -63,6 +63,8 @@ lavalink/
    | `LOG_LEVEL` | no | `INFO` (use `DEBUG` to see per-source failures) |
    | `EMPTY_LEAVE_SECONDS` | no | Default `600`. Leave after nobody has listened this long (`0` = never). Music is paused immediately when no humans are present. |
    | `SIBLING_BOT_IDS` | multi-bot only | Comma-separated user IDs of the OTHER bot(s). Enables multi-bot routing. |
+
+   The reference variable keeps the URI aligned with Lavalink's actual private domain and listening port. With the example `PORT=2333`, Railway resolves it to a URL such as `http://music-bot.railway.internal:2333` if that is the private domain shown in Lavalink's Settings.
 
 4. Deploy. Healthy startup logs include `lavalink node ready` and `lavalink version ok ... (DAVE capable)`.
 
@@ -95,6 +97,7 @@ Slash commands are not routed: pick the bot you want in Discord's command picker
 
 | Symptom | Fix |
 |---|---|
+| Bot logs repeatedly show a Lavalink websocket connection retry | Make sure Lavalink is running, then set the bot's `LAVALINK_URI` to `http://${{lavalink.RAILWAY_PRIVATE_DOMAIN}}:${{lavalink.PORT}}` and confirm the password matches. |
 | "Music backend is offline" | Check `LAVALINK_URI`/password match; the bot reconnects automatically every 10 s. |
 | Every YouTube source fails | Re-run OAuth (step 3) with a fresh throwaway account; SoundCloud and yt-dlp still serve as fallbacks. |
 | State is lost on redeploy | Confirm the volume is mounted at `/data` and `RAILWAY_RUN_UID=0` is set. |
