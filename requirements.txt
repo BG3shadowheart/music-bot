@@ -1,4 +1,2 @@
-discord.py[voice]>=2.7.0
-wavelink>=3.5.1
-yt-dlp
-aiohttp>=3.9.0
+discord.py[voice]>=2.5,<3
+yt-dlp>=2025.1.15
